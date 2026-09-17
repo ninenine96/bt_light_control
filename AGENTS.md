@@ -29,14 +29,27 @@ Build order from PLAN.md — checked items are done and verified on this host:
       **Verified producing real frames** (~120 fps raw; consumer-paced reads)
       and the KWin consent dialog is now **silent across repeated runs**
       (restore-token rotation + seeded grant; see capture.py section below).
-- [ ] **Step 3 — `ambient.py`** end-to-end in foreground, pointed at the real
-      strip. NOT STARTED — this is the next milestone.
-- [ ] Step 4 — smoothing + thresholding (DELTA/tick tuning).
+- [x] **Step 3 — `ambient.py`** foreground prototype wired end-to-end.
+      **Verified on the real strip**: hue follows the monitor, brightness maps
+      via RGB, wake-on-change short-circuit holds idle CPU ≈ 0, smoothing
+      (circular EMA) + delta-gate (~0.5°) + ~5 Hz write cap work live, and
+      **auto-reconnect after a mid-run link drop** was observed (`write failed`
+      → `connected to …` again). Unit suite in `test_ambient.py`.
+- [ ] Step 4 — smoothing + thresholding further tuning (alpha / change-detector
+      sensitivity; mostly tune the `--alpha`/`--min-delta`/`--change-threshold`
+      defaults I picked — 0.4 / 0.5° / 2.0).
 - [ ] Step 5 — systemd user unit + Unix-socket control (`ambientctl`).
 - [ ] Step 6 — logging/journald + reconnect/backoff hardening + stop-state.
 
-Current milestone: build `ambient.py` (foreground, no daemon yet) and verify hue
-tracks the monitor on the physical strip.
+Current milestone: Step 4 tuning, then Step 5 (systemd unit + ambientctl socket).
+
+Full pipeline is: `capture.py` → `coloralg.py` → smoother (circular EMA in
+`ambient.py`) → `ledctl_lib.Strip` (reconnectable BLE writer). All four scripts
+plus `test_coloralg.py`/`test_ambient.py` pass on this host.
+
+Docs live in **`README.md`** (overview) + **`docs/`** (`protocol.md`,
+`usage.md`, `troubleshooting.md`). Keep them in sync when the CLI/flags,
+protocol, or operational gotchas change.
 
 ## Hardware / environment
 
@@ -105,6 +118,9 @@ All drop near-gray (sat < 0.12) and near-black (val < 0.08) pixels before comput
 
 ### `ledctl.py` — main CLI (chmod +x)
 
+Protocol/frame-builders/scan now live in **`ledctl_lib.py`** (shared with
+`ambient.py`); `ledctl.py` is CLI-only. Docs above still apply verbatim.
+
 ```bash
 python3 ledctl.py --scan                          # find LEDDMX strips
 python3 ledctl.py --mac 41:42:9A:B1:2F:70 on
@@ -120,6 +136,59 @@ python3 ledctl.py --mac 41:42:9A:B1:2F:70 rainbow --minutes 30 --brightness 80
 - Named colours: red, green, blue, cyan, magenta, yellow, white, warm, orange,
   purple, pink, off_black.
 - `rainbow` handles SIGTERM/SIGINT gracefully; strip is left on last colour.
+
+### `ledctl_lib.py` — shared protocol + reconnectable `Strip` (used by ambient)
+
+- Frame builders (`color_frame`, `brightness_frame`, `pattern_frame`), constants
+  (`CHAR_UUID`, `FRAME_ON/OFF`, `NAMED_COLORS`, `NAME_PREFIXES`), `scan_for_strip`,
+  `discover_strips`, `is_strip_name`.
+- `Strip(address)` — self-healing BLE writer the ambient daemon relies on:
+  - keeps a background `BleakScanner` running for the link's lifetime so it
+    notices a re-advertisement the moment the sleeping device reappears;
+  - `connect(max_wait)` retries with exponential backoff (2→30 s);
+  - **stops the scanner before each connect attempt** — BlueZ refuses to start a
+    connection while discovery is active (`org.bluez.Error.InProgress` on this
+    host), and restarts it during backoff.
+  - writes with `response=False`; raises `ConnectionError` when the link is gone
+    (caller reconnects).
+  - `probe()` — real ATT read round-trip (3 s timeout); returns False and
+    force-drops the client when the radio link is actually gone. BlueZ's
+    `is_connected` alone is NOT trustworthy (see the stale-link gotcha below).
+
+### `ambient.py` — foreground hue-sync daemon (PLAN step 3, verified live)
+
+```bash
+python3 ambient.py                                          # auto-scan strip
+python3 ambient.py --mac 41:42:9A:B1:2F:70
+python3 ambient.py --mac 41:42:9A:B1:2F:70 --brightness 80 --tick 0.2
+python3 ambient.py --no-write                               # capture→colour only
+```
+
+Pipeline: `capture.py` → `coloralg.py` (default `circular`) → circular-EMA
+smoother → `ledctl_lib.Strip`. Two cooperating asyncio tasks:
+- **producer** captures + computes + smooths, with the wake-on-change
+  short-circuit (mean-abs frame delta below `--change-threshold` skips all
+  colour math → idle CPU ≈ 0).
+- **writer** owns BLE: reconnects via `Strip.connect` with backoff, applies the
+  delta-gate (write only when hue arc ≥ `--min-delta`) and a 5 Hz write cap,
+  always writes the latest hue (drops stale, no queueing). Grey/black frames
+  hold the last colour (no strobe).
+- **Stale-link probe (added 2026-09-18).** Symptom seen live: the strip was
+  changing colour on its *own* (running its built-in colour-cycle effect) and
+  ignoring every screen change, while BlueZ still reported "connected". Root
+  cause: the strip silently drops the radio after ~20–60 s, BlueZ keeps
+  `is_connected=True`, and every GATT write "succeeds" into a dead link.
+  Fix: `Strip.probe()` issues a real ATT read round-trip (read prop is
+  supported); when it fails it force-drops the client so reconnect can start.
+  While the writer is idle (delta-gate suppressing writes for ≥ 2 s) it probes,
+  so a stale link is caught even on a completely static screen.
+- Flags: `--algo --brightness --width/--height --tick --alpha --min-delta
+  --change-threshold --timeout --stop-state off|last --no-write`.
+- On SIGINT/SIGTERM: `--stop-state off` (default) powers the strip off,
+  `last` leaves it on the current colour. (Step 6 will finalise the daemon
+  stop-state decision.)
+- `test_ambient.py` covers EMA wrap, arc, frame-delta, hue→rgb, producer
+  tracking/hold, writer power-on + delta gate (fake capture/strip, no hardware).
 
 ### `test_device.py` — raw frame tester
 
@@ -173,6 +242,23 @@ print(c.read_frame_pixels()[:3]); c.close()"
   advertising, and also when powered off. `BleakClient(address)` then fails with
   "Device not found". Scan (or wait) for it to reappear; occasionally needs a
   physical power-cycle. Waiting ~20s for a fresh advertisement usually works.
+- **Scan-vs-connect BlueZ conflict.** BlueZ refuses a `Connect` while any
+  discovery session is active (`org.bluez.Error.InProgress`); passive scans are
+  also rejected here unless you pass `or_patterns`. `ledctl_lib.Strip` handles
+  both: it uses an active-mode `BleakScanner` to *detect* the device, stops the
+  scanner just before each connect attempt, and restarts it during backoff.
+  Verified: connects `41:42:9A:B1:2F:70` reliably even mid-sleep.
+- **Stale/phantom BLE link (2026-09-18 — the "strip runs its own colours" bug).**
+  After ~20–60 s of runtime the strip may silently drop the radio link and run
+  its built-in colour-cycle effect, while BlueZ *still* reports
+  `is_connected=True`. Every subsequent `write_gatt_char` "succeeds" (BlueZ
+  queues it locally) but nothing reaches the LEDs — ambient appears broken and
+  the strip visibly cycles green/purple on its own. `is_connected` is NOT a
+  trustworthy health signal. Recovery is in the code: `Strip.probe()` does a
+  real ATT read round-trip and force-drops the client when it fails; ambient
+  probes every ≥ 2 s while idle (no writes firing). A stale link can NOT be
+  cleared from `bluetoothctl` alone when BlueZ still thinks it's connected —
+  the probe's forced `disconnect()` is what un-wedges it.
 - **SIGTERM during rainbow also loses buffered stdout** when piped — colour
   frames keep being written regardless.
 - `ledctl.py` blocks stdout-buffering surprises by flushing through normal

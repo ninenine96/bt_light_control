@@ -28,55 +28,17 @@ import sys
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakDeviceNotFoundError
 
-SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
-CHAR_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
-
-NAME_PREFIXES = ("LED DMX", "LEDDMX", "LED-DMX")
-# Verified on this unit (LEDDMX-03-2F70): plain RGB channel order.
-COLOR_ORDER = "rgb"
-
-FRAME_ON = bytes([0x7B, 0xFF, 0x04, 0x03, 0xFF, 0xFF, 0xFF, 0xFF, 0xBF])
-FRAME_OFF = bytes([0x7B, 0xFF, 0x04, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0xBF])
-
-NAMED_COLORS = {
-    "red": (255, 0, 0),
-    "green": (0, 255, 0),
-    "blue": (0, 0, 255),
-    "cyan": (0, 255, 255),
-    "magenta": (255, 0, 255),
-    "yellow": (255, 255, 0),
-    "white": (255, 255, 255),
-    "warm": (255, 180, 90),
-    "orange": (255, 128, 0),
-    "purple": (150, 0, 255),
-    "pink": (255, 60, 160),
-    "off_black": (0, 0, 0),
-}
-
-
-def color_frame(r: int, g: int, b: int) -> bytes:
-    channels = {"r": r, "g": g, "b": b}
-    c1, c2, c3 = (channels[ch] for ch in COLOR_ORDER)
-    return bytes([0x7B, 0xFF, 0x07, c1, c2, c3, 0x00, 0xFF, 0xBF])
-
-
-def brightness_frame(pct: int) -> bytes:
-    pct = max(0, min(100, int(pct)))
-    b1 = pct * 32 // 100
-    return bytes([0x7B, 0xFF, 0x01, b1, pct, 0x00, 0xFF, 0xFF, 0xBF])
-
-
-def pattern_frame(idx: int) -> bytes:
-    idx = max(0, min(210, int(idx)))
-    return bytes([0x7B, 0xFF, 0x03, idx, 0xFF, 0xFF, 0xFF, 0xFF, 0xBF])
-
-
-async def scan_for_strip(timeout: float = 8.0) -> str | None:
-    devices = await BleakScanner.discover(timeout=timeout)
-    for d in devices:
-        if d.name and d.name.upper().startswith(tuple(p.upper() for p in NAME_PREFIXES)):
-            return d.address
-    return None
+from ledctl_lib import (
+    CHAR_UUID,
+    FRAME_ON,
+    FRAME_OFF,
+    NAMED_COLORS,
+    NAME_PREFIXES,
+    brightness_frame,
+    color_frame,
+    pattern_frame,
+    scan_for_strip,
+)
 
 
 async def send_one(payload: bytes, address: str | None) -> None:

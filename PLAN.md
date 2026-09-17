@@ -117,11 +117,25 @@ defaults sane so the daemon runs with zero config.
    — **DONE (2026-09-17), frames verified on KWin Wayland.** Note: real transport
    uses a direct session-PipeWire socket (`path=NODE_ID`); the portal's
    OpenPipeWireRemote fd fails on this host (see capture.py / AGENTS.md).
-3. `ambient.py` wired end-to-end in foreground mode (no daemon yet), pointed at
-   the real strip. Verify hue follows the monitor. — **NEXT.**
+3. ✅ `ambient.py` wired end-to-end in foreground mode (no daemon yet), pointed
+   at the real strip; verify hue follows the monitor. — **DONE
+   (2026-09-17).** Two-task design: producer (capture→colour→circular-EMA
+   smoother, wake-on-change short-circuit) + writer (reconnectable BLE,
+   delta-gate + ~5 Hz cap). Verified live: hue tracks monitor, brightness via
+   RGB, auto-reconnect after mid-run link drop, idle ≈ 0 CPU. Protocol is shared
+   via the new `ledctl_lib.py` (refactored out of `ledctl.py`). Unit suite:
+   `test_ambient.py`.
 4. Smoothing + thresholding; tune so a changing wallpaper morphs gracefully.
+   — Current defaults in `ambient.py`: `--alpha 0.4`, `--min-delta 0.5°`,
+   `--change-threshold 2.0`. Sandbox with `--no-write` + real capture.
 5. systemd unit + socket control + `enable/disable` toggle.
-6. Logging (journald) + reconnect/backoff hardening + stop-state decision.
+6. Logging (journald) + reconnect/backoff hardening + stop-state decision
+   (current `--stop-state` default = off).
+   — Head-start (2026-09-18): stale-link detection already landed — the strip
+   silently drops the radio while BlueZ says "connected" (its built-in colour
+   cycle takes over, writes "succeed" into a dead link). `Strip.probe()` does a
+   real ATT read round-trip; ambient probes ≥ 2 s while idle. Reconnect/backoff
+   itself was done in step 3.
 
 ## Performance / negligible-tax strategy
 
