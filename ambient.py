@@ -45,6 +45,11 @@ from ledctl_lib import FRAME_OFF, FRAME_ON, Strip, color_frame
 
 # write cap: fire-and-forget frames to a cheap BLE strip are best at ~5 Hz
 MIN_WRITE_INTERVAL = 0.2
+# heartbeat: re-send the current colour this often while the screen is static,
+# so the strip never sits long enough without a frame to drop the link and
+# fall back to its built-in colour-cycle effect (the "stalls and runs its own
+# colours" bug).  Continuous frames keep it awake in solid-colour mode.
+HEARTBEAT_INTERVAL = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +106,6 @@ class Ambient:
         self._target: dict | None = None   # latest {"hue": <deg>} from producer
         self._last_written_hue: float | None = None
         self._last_write_t = 0.0
-        self._last_probe_t = 0.0
 
     # -- producer: capture + colour ------------------------------------------
 
@@ -208,19 +212,23 @@ class Ambient:
                 if self._last_written_hue is not None \
                         and circular_arc(target, self._last_written_hue) \
                             < self.cfg.min_delta:
-                    # Idle gate: while the screen is static (no writes fired),
-                    # the strip may drop the radio link while BlueZ still says
-                    # "connected".  Probe with a real ATT read every couple of
-                    # seconds; if it fails, reconnect.
-                    if not self.cfg.no_write and not self.strip.connected:
-                        break
-                    if not self.cfg.no_write \
-                            and time.monotonic() - self._last_probe_t >= 2.0:
-                        self._last_probe_t = time.monotonic()
-                        if not await self.strip.probe():
-                            print("[led] stale link detected, reconnecting",
+                    # Heartbeat on static screens: keep feeding the strip the
+                    # current colour so it never idles long enough to drop the
+                    # radio and start cycling its built-in effects on its own.
+                    now = time.monotonic()
+                    if self.cfg.heartbeat > 0 and not self.cfg.no_write \
+                            and now - self._last_write_t >= self.cfg.heartbeat:
+                        rgb = hue_to_rgb(target, self.cfg.brightness)
+                        try:
+                            await self.strip.write(color_frame(*rgb))
+                            print(f"[led] heartbeat \u2192 rgb={rgb}",
                                   file=sys.stderr)
-                            break
+                            self._last_write_t = now
+                        except (BleakError, ConnectionError, OSError) as exc:
+                            print(f"[led] heartbeat failed "
+                                  f"({type(exc).__name__}): {exc}",
+                                  file=sys.stderr)
+                            break  # let the outer loop reconnect
                     continue
 
                 # rate cap: never fire faster than ~5 Hz; keep the target
@@ -298,6 +306,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--change-threshold", type=float, default=2.0,
                    help="frame mean-abs-delta below which the screen is 'static' "
                         "(-1 disables the short-circuit)")
+    p.add_argument("--heartbeat", type=float, default=HEARTBEAT_INTERVAL,
+                   help="re-send the current colour this often (s) while the "
+                        "screen is static so the strip never stalls; 0 disables")
     p.add_argument("--timeout", type=float, default=60.0,
                    help="seconds to keep retrying a lost BLE link")
     p.add_argument("--stop-state", choices=("off", "last"), default="off",

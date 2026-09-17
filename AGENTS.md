@@ -150,10 +150,9 @@ python3 ledctl.py --mac 41:42:9A:B1:2F:70 rainbow --minutes 30 --brightness 80
     connection while discovery is active (`org.bluez.Error.InProgress` on this
     host), and restarts it during backoff.
   - writes with `response=False`; raises `ConnectionError` when the link is gone
-    (caller reconnects).
-  - `probe()` — real ATT read round-trip (3 s timeout); returns False and
-    force-drops the client when the radio link is actually gone. BlueZ's
-    `is_connected` alone is NOT trustworthy (see the stale-link gotcha below).
+    (caller reconnects — writes fail loudly the moment BlueZ wakes up to the drop).
+    BlueZ's `is_connected` is checked before every write, but see the stale-link
+    gotcha below for why an always-connected write cadence beats trusting it.
 
 ### `ambient.py` — foreground hue-sync daemon (PLAN step 3, verified live)
 
@@ -173,22 +172,30 @@ smoother → `ledctl_lib.Strip`. Two cooperating asyncio tasks:
   delta-gate (write only when hue arc ≥ `--min-delta`) and a 5 Hz write cap,
   always writes the latest hue (drops stale, no queueing). Grey/black frames
   hold the last colour (no strobe).
-- **Stale-link probe (added 2026-09-18).** Symptom seen live: the strip was
-  changing colour on its *own* (running its built-in colour-cycle effect) and
-  ignoring every screen change, while BlueZ still reported "connected". Root
-  cause: the strip silently drops the radio after ~20–60 s, BlueZ keeps
-  `is_connected=True`, and every GATT write "succeeds" into a dead link.
-  Fix: `Strip.probe()` issues a real ATT read round-trip (read prop is
-  supported); when it fails it force-drops the client so reconnect can start.
-  While the writer is idle (delta-gate suppressing writes for ≥ 2 s) it probes,
-  so a stale link is caught even on a completely static screen.
+- **Heartbeat (replaces the earlier ATT probe; 2026-09-18).** Symptom seen
+  live: the strip was changing colour on its *own* (running its built-in
+  colour-cycle effect) and ignoring every screen change, while BlueZ still
+  reported "connected". Root cause: the strip idles out after ~20–60 s without
+  any frames and silently drops the radio (BlueZ keeps `is_connected=True`, so
+  writes "succeed" into a dead link). Simplest fix that skips link-detection
+  entirely: **never let it idle** — on a static screen the writer re-sends the
+  current colour every `--heartbeat` (default 5 s, `0` disables). Continuous
+  frames keep the strip awake in solid-colour mode (the `rainbow` path never
+  stalls, which is the proof). If the link does die, the next write still
+  raises and reconnect kicks in as before.
+  **Verified live (2026-09-18):** heartbeat fired at exact cadence with the
+  same colour, and on a mid-run radio drop the writer logged
+  `heartbeat failed (ConnectionError): strip link is down` → `connected to …`
+  → colour re-synced, all in ~1 s. The strip cannot stall in its own effect
+  mode because colour frames arrive every heartbeat or on reconnect.
 - Flags: `--algo --brightness --width/--height --tick --alpha --min-delta
-  --change-threshold --timeout --stop-state off|last --no-write`.
+  --change-threshold --heartbeat --timeout --stop-state off|last --no-write`.
 - On SIGINT/SIGTERM: `--stop-state off` (default) powers the strip off,
   `last` leaves it on the current colour. (Step 6 will finalise the daemon
   stop-state decision.)
 - `test_ambient.py` covers EMA wrap, arc, frame-delta, hue→rgb, producer
-  tracking/hold, writer power-on + delta gate (fake capture/strip, no hardware).
+  tracking/hold, writer power-on + delta gate + heartbeat (fake capture/strip,
+  no hardware).
 
 ### `test_device.py` — raw frame tester
 
@@ -254,11 +261,11 @@ print(c.read_frame_pixels()[:3]); c.close()"
   `is_connected=True`. Every subsequent `write_gatt_char` "succeeds" (BlueZ
   queues it locally) but nothing reaches the LEDs — ambient appears broken and
   the strip visibly cycles green/purple on its own. `is_connected` is NOT a
-  trustworthy health signal. Recovery is in the code: `Strip.probe()` does a
-  real ATT read round-trip and force-drops the client when it fails; ambient
-  probes every ≥ 2 s while idle (no writes firing). A stale link can NOT be
-  cleared from `bluetoothctl` alone when BlueZ still thinks it's connected —
-  the probe's forced `disconnect()` is what un-wedges it.
+  trustworthy health signal. **Workaround (in the code): never let the strip
+  idle.** The writer re-sends the current colour frame every `--heartbeat`
+  (default 5 s) on static screens, so there is never a ~20–60 s gap, and the
+  drop never happens in the first place. If the link still dies, the next
+  write raises and the existing reconnect/backoff takes over.
 - **SIGTERM during rainbow also loses buffered stdout** when piped — colour
   frames keep being written regardless.
 - `ledctl.py` blocks stdout-buffering surprises by flushing through normal

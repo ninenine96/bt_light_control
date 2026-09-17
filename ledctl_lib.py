@@ -215,34 +215,8 @@ class Strip:
             self._client = None
         await self._watch_stop()
 
-    def link_alive(self) -> bool:
-        """True if `write()` would actually reach the radio (not a stale link).
-
-        BlueZ reports `is_connected=True` even after the strip silently drops
-        the radio and falls back to its built-in colour-cycle effect, so we
-        must probe with a real ATT round-trip before trusting writes.
-        """
-        return bool(self._client is not None and self._client.is_connected)
-
-    async def probe(self) -> bool:
-        """Real ATT read round-trip; False when the radio link is gone.
-
-        Fails (and force-drops the client) if BlueZ claims "connected" but
-        the device is no longer answering — the stale-link case where every
-        write would otherwise "succeed" into a dead radio.
-        """
-        if not self.link_alive():
-            return False
-        try:
-            await asyncio.wait_for(
-                self._client.read_gatt_char(CHAR_UUID), timeout=3.0)
-            return True
-        except (BleakError, asyncio.TimeoutError, OSError) as exc:
-            await self.disconnect()
-            return False
-
     async def write(self, payload: bytes) -> None:
         """Write a frame.  Raises if the link is gone (caller reconnects)."""
-        if not self.link_alive():
+        if self._client is None or not self._client.is_connected:
             raise ConnectionError("strip link is down")
         await self._client.write_gatt_char(CHAR_UUID, payload, response=False)

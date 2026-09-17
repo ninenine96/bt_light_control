@@ -111,9 +111,6 @@ class FakeStrip:
     async def write(self, payload):
         self.writes.append(payload)
 
-    async def probe(self):
-        return self.connected
-
 
 def _run_producer(frames, argv):
     cfg = parse_args(argv)
@@ -180,6 +177,30 @@ def test_writer_delta_gate():
     print(f"  OK    {len(fake.writes)} writes, sub-threshold change suppressed")
 
 
+def test_writer_heartbeat():
+    print("\n[Test] writer: re-sends colour on static screen (heartbeat)")
+    cfg = parse_args(["--min-delta", "10", "--heartbeat", "0.15"])
+    a = Ambient(cfg)
+    fake = FakeStrip()
+    a.strip = fake
+
+    async def go():
+        task = asyncio.create_task(a._writer())
+        a._target = {"hue": 120.0}
+        a._notify.set()
+        await asyncio.sleep(0.9)
+        a.stop()
+        await task
+
+    asyncio.run(go())
+    colour_writes = [w for w in fake.writes if w != FRAME_ON]
+    assert len(colour_writes) >= 4, \
+        f"heartbeat should repeat colour writes, got {len(colour_writes)}"
+    assert all(w == color_frame(*hue_to_rgb(120.0, 100)) for w in colour_writes), \
+        "heartbeat wrote a different colour"
+    print(f"  OK    {len(colour_writes)} heartbeat writes at ~{0.9/len(colour_writes):.2f}s cadence")
+
+
 if __name__ == "__main__":
     import os
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -190,4 +211,5 @@ if __name__ == "__main__":
     test_producer_tracks_hue()
     test_producer_holds_on_neutral()
     test_writer_delta_gate()
+    test_writer_heartbeat()
     print("\n✅ All ambient tests passed.\n")

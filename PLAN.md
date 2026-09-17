@@ -131,11 +131,14 @@ defaults sane so the daemon runs with zero config.
 5. systemd unit + socket control + `enable/disable` toggle.
 6. Logging (journald) + reconnect/backoff hardening + stop-state decision
    (current `--stop-state` default = off).
-   — Head-start (2026-09-18): stale-link detection already landed — the strip
-   silently drops the radio while BlueZ says "connected" (its built-in colour
-   cycle takes over, writes "succeed" into a dead link). `Strip.probe()` does a
-   real ATT read round-trip; ambient probes ≥ 2 s while idle. Reconnect/backoff
-   itself was done in step 3.
+   — Head-start (2026-09-18): the "strip stalls / runs its own colours" bug is
+   already handled — the strip silently drops the radio while BlueZ says
+   "connected" because it idles out (~20–60 s without frames). Workaround in the
+   code: don't fix the link, **never let it idle** — ambient re-sends the
+   current colour every `--heartbeat` (default 5 s) on static screens, keeping
+   the strip awake in solid-colour mode (the `rainbow` path never stalls, proof
+   that continuous frames hold the link). If a link still dies, the next write
+   raises and the step-3 reconnect/backoff takes over.
 
 ## Performance / negligible-tax strategy
 
