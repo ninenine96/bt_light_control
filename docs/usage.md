@@ -56,16 +56,47 @@ python3 ambient.py --no-write                               # capture→colour o
 | `--tick S` | 0.2 | capture/smoothing tick (s) |
 | `--alpha F` | 0.4 | hue EMA factor (0–1); higher = more responsive |
 | `--min-delta DEG` | 0.5 | min hue arc (°) to trigger a BLE write |
+| `--max-step DEG` | 8.0 | max hue change (°) per BLE write — bounds transition speed so colour changes glide; `0` disables |
 | `--change-threshold F` | 2.0 | frame mean-abs-delta below which the screen is "static"; `-1` disables the short-circuit |
 | `--timeout S` | 60.0 | seconds to keep retrying a lost BLE link |
 | `--stop-state` | `off` | `off` powers the strip down on exit; `last` leaves it on the current colour |
 | `--no-write` | off | dry run: compute hue, never touch BLE |
+| `--socket PATH` | auto | control-socket path (default: `$AMBIENT_SOCKET`, else `$XDG_RUNTIME_DIR/ambient.sock`) |
 
 Logs go to stderr. SIGINT/SIGTERM shuts down cleanly into the `--stop-state`
 behaviour.
 
 Tuning tips: sandbox tuning runs with `--no-write` so the strip isn't spammed;
 set `--alpha 1.0` to disable smoothing entirely when debugging.
+
+## `ambientctl` — socket control + systemd install
+
+```bash
+python3 ambientctl status          # paused?/connected?/hue/uptime
+python3 ambientctl on              # resume ambient (reconnect strip)
+python3 ambientctl off             # pause: release BLE link, hold last colour
+python3 ambientctl stop            # shut the daemon down (apply --stop-state)
+
+python3 ambientctl install [--mac ADDR]   # write ~/.config/systemd/user/ambient.service
+python3 ambientctl enable                # systemctl --user enable --now ambient
+python3 ambientctl disable               # systemctl --user disable --now ambient
+python3 ambientctl uninstall             # remove the unit
+```
+
+- `on`/`off`/`status`/`stop` talk to the daemon over the control socket — no
+  restart needed. `off` pauses sensing *and* drops the BLE link (the strip
+  holds its last colour); the single-connection controller is free for a phone
+  app while paused.
+- The socket lives at `$AMBIENT_SOCKET`, else `$XDG_RUNTIME_DIR/ambient.sock`
+  (falls back to `~/.local/state/ambient/ambient.sock`). Point the CLI
+  elsewhere with `--socket PATH` / the `AMBIENT_SOCKET` env var.
+- `install` bakes the resolved `ambient.py` path + socket path into the unit;
+  pass `--mac` to bake a fixed strip address (faster/more reliable reconnect)
+  or omit it to auto-scan. The unit uses `Restart=on-failure` — a deliberate
+  `ambientctl stop` (`systemctl --user stop`) stays stopped, but a crash or a
+  missing device restarts it every 3 s.
+- Lifetime is tied to your graphical session (`PartOf=graphical-session.target`,
+  `WantedBy=default.target`).
 
 ## `capture.py` — screen capture self-test
 
@@ -114,7 +145,7 @@ No hardware needed:
 
 ```bash
 python3 test_coloralg.py     # all 4 algorithms on solid/noisy/gray/band inputs
-python3 test_ambient.py      # EMA wrap, arc, frame-delta, hue→rgb, producer/writer logic
+python3 test_ambient.py      # EMA wrap, arc, frame-delta, hue→rgb, producer/writer, control socket
 ```
 
 Both exit non-zero on failure and print `✅ All … passed` on success.

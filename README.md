@@ -36,6 +36,8 @@ python3 ledctl.py --mac 41:42:9A:B1:2F:70 rainbow --minutes 30 --brightness 80
 
 # ambient hue sync — strip follows your screen
 python3 ambient.py --mac 41:42:9A:B1:2F:70                    # --mac optional (auto-scans)
+python3 ambientctl status                                     # live: on/off/status/stop
+python3 ambientctl install && ambientctl enable               # autostart on login
 
 # dry run: capture → colour only, never touches BLE (great for tuning)
 python3 ambient.py --no-write
@@ -53,8 +55,9 @@ If `ambient.py --mac …` can't find the device, see
 | Script | Purpose |
 |---|---|
 | `ledctl.py` | CLI: on/off/color/brightness/pattern/rainbow/scan |
-| `ledctl_lib.py` | Shared frame builders + the reconnectable `Strip` BLE wrapper |
-| `ambient.py` | Foreground ambient hue-sync daemon (capture → colour → smoother → strip) |
+| `ledctl_lib.py` | Shared frame builders, reconnectable `Strip` BLE wrapper, socket path |
+| `ambient.py` | Ambient hue-sync daemon (capture → colour → smoother → strip + control socket) |
+| `ambientctl` | Control CLI: `status`/`on`/`off`/`stop` + systemd `install`/`enable`/`disable` |
 | `coloralg.py` | Four colour algorithms (circular-mean, histogram, k-means, average) |
 | `capture.py` | KWin screen capture via xdg-desktop-portal ScreenCast → PipeWire |
 | `test_device.py` | Raw frame tester for protocol/colour-order calibration |
@@ -64,7 +67,7 @@ Every script's full usage is in [docs/usage.md](docs/usage.md).
 
 ## The ambient pipeline
 
-`ambient.py` runs two cooperating asyncio tasks:
+`ambient.py` runs three cooperating asyncio tasks:
 
 - **Producer** — captures a tiny 48×27 RGBA frame, computes the predominant
   hue, and smooths it with a circular (wrap-aware) EMA. A **wake-on-change
@@ -76,6 +79,11 @@ Every script's full usage is in [docs/usage.md](docs/usage.md).
   moment the device re-advertises), applies a delta-gate (only writes when the
   hue moved ≥ ~0.5°) and a ~5 Hz write cap, and always writes the *latest* hue,
   dropping stale frames rather than queueing.
+- **Control socket** — a Unix socket (`ambientctl` talks to it). `on`/`off`
+  pause and resume the daemon live: `off` stops sensing *and* releases the BLE
+  link so the strip keeps its last colour and the single-connection controller
+  is free; `on` reconnects. `stop` shuts the daemon down into the
+  `--stop-state` behaviour.
 
 Neutral/gray/black frames hold the last colour — a plain desktop never strobes.
 See [docs/protocol.md](docs/protocol.md) for the wire protocol and
@@ -83,9 +91,11 @@ See [docs/protocol.md](docs/protocol.md) for the wire protocol and
 
 ## Tuning
 
-The defaults (`--alpha 0.4`, `--min-delta 0.5`, `--change-threshold 2.0`) are a
-good starting point. Sandbox with `ambient.py --no-write` + real capture to
-tune. Choose a different hue algorithm with `--algo`:
+The defaults (`--alpha 0.4`, `--min-delta 0.5`, `--max-step 8.0`,
+`--change-threshold 2.0`) are a good starting point. `--max-step` bounds the hue
+change per BLE write (8°/write at ~5 Hz ≈ 40°/s), so a wallpaper switch glides
+across the wheel instead of snapping. Sandbox with `ambient.py --no-write` +
+real capture to tune. Choose a different hue algorithm with `--algo`:
 
 | Algorithm | Best for |
 |---|---|
@@ -110,11 +120,12 @@ at **3–5 Hz max**, not screen rate:
 
 ## Project status
 
-Reverse-engineered protocol, foreground `ledctl` CLI, and the ambient daemon
-are all done and verified on real hardware. Still on the roadmap:
+Reverse-engineered protocol, `ledctl` CLI, the ambient daemon, and the
+socket-control + systemd plumbing are built (unit + `ambientctl` offline-tested).
+Still on the roadmap:
 
 - [ ] Smoothing/threshold tuning in production (Step 4)
-- [ ] systemd user unit + Unix-socket control (`ambientctl`) (Step 5)
+- [ ] systemd user unit + Unix-socket control (`ambientctl`) — code done, needs a live run (Step 5)
 - [ ] journald logging + reconnect/backoff hardening (Step 6)
 
 ## Docs

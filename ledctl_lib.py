@@ -24,10 +24,29 @@ Protocol (9-byte frames, framing 7B ... BF), written to char 0xFFE1:
 from __future__ import annotations
 
 import asyncio
+import os
 import time
+from pathlib import Path
 
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakDeviceNotFoundError, BleakError
+
+# Ambient control socket: the daemon (ambient.py) listens here and ambientctl
+# talks to it.  Single source of truth so the two never drift.
+# Resolution order: $AMBIENT_SOCKET, then $XDG_RUNTIME_DIR/ambient.sock
+# (per-user session, tmpfs), then ~/.local/state/ambient/ambient.sock.
+AMBIENT_SOCKET_ENV = "AMBIENT_SOCKET"
+AMBIENT_SOCKET_NAME = "ambient.sock"
+
+
+def default_socket_path() -> str:
+    env = os.environ.get(AMBIENT_SOCKET_ENV)
+    if env:
+        return env
+    rt = os.environ.get("XDG_RUNTIME_DIR")
+    if rt:
+        return os.path.join(rt, AMBIENT_SOCKET_NAME)
+    return str(Path.home() / ".local" / "state" / "ambient" / AMBIENT_SOCKET_NAME)
 
 SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
 CHAR_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"

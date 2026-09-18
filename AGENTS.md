@@ -20,7 +20,7 @@ Standing instruction for every future session: whenever you make progress in
 this endeavour (new files, decisions, findings, gotchas, test results), update
 this AGENTS.md to reflect it.
 
-## Progress status (last update: 2026-09-17)
+## Progress status (last update: 2026-09-18)
 
 Build order from PLAN.md — checked items are done and verified on this host:
 
@@ -35,17 +35,44 @@ Build order from PLAN.md — checked items are done and verified on this host:
       (circular EMA) + delta-gate (~0.5°) + ~5 Hz write cap work live, and
       **auto-reconnect after a mid-run link drop** was observed (`write failed`
       → `connected to …` again). Unit suite in `test_ambient.py`.
-- [ ] Step 4 — smoothing + thresholding further tuning (alpha / change-detector
-      sensitivity; mostly tune the `--alpha`/`--min-delta`/`--change-threshold`
-      defaults I picked — 0.4 / 0.5° / 2.0).
-- [ ] Step 5 — systemd user unit + Unix-socket control (`ambientctl`).
-- [ ] Step 6 — logging/journald + reconnect/backoff hardening + stop-state.
+- [x] **Step 4 — smoothing + thresholding. Defaults tuned in code
+      (2026-09-18):** `--alpha 0.4`, `--min-delta 0.5°`, **`--max-step 8.0°`**
+      (new — bounds hue change per BLE write so colour transitions sweep at
+      ≈40°/s instead of snapping; `test_writer_sweeps_large_change` verifies a
+      90° jump becomes ~10×10° steps), `--change-threshold 2.0`. Remaining is
+      live tuning preference only (wallpaper pace), not code.
+- [x] **Step 5 — `ambientctl` + control socket + systemd user unit.**
+      **Fully verified live under systemd on this host (2026-09-18):** unit
+      installed + enabled, daemon cold-starts via `systemctl --user start`, the
+      KWin consent dialog is silent (restore token round-trips), capture starts,
+      BLE connects + hue syncs + auto-reconnects after a mid-run link drop, and
+      the full socket control loop works against the real strip:
+      `status` (running/paused, link, hue, uptime) · `off` (pauses sensing AND
+      releases the BLE link — single-connection controller is free; strip holds
+      colour) · `on` (reconnects + re-syncs) · `stop` (applies `--stop-state`
+      `off` = `[led] strip off`, socket file unlinked, service ends `inactive`
+      and stays stopped — `Restart=on-failure` does NOT respawn a deliberate
+      stop). One transient earlier today: a fresh `systemctl --user start` hung
+      at portal `Start` while xdg-desktop-portal-KDE was in a bad state; a
+      `systemctl --user restart xdg-desktop-portal.service` resolved it
+      permanently (restore token worked on every subsequent start). All offline
+      tests in `test_ambient.py` extend to pause/resume + socket.
+      Deliberate deviation from PLAN: unit uses `Restart=on-failure` (not
+      `always`) so an intentional `ambientctl stop` stays stopped.
+- [~] Step 6 — logging/journald + reconnect/backoff hardening + stop-state.
+      Partially done: portal-Start no longer wedges shutdown (daemon-thread +
+      retry, 2026-09-18) and logs go to journald via stderr; the reconnect
+      backoff + heartbeat hardening landed in Step 3/5. Remaining: journald
+      structured logging review, if any.
 
-Current milestone: Step 4 tuning, then Step 5 (systemd unit + ambientctl socket).
+Current milestone: Step 4 tuning (needs live tuning on a range of wallpapers);
+Step 5 (install/enable + live socket control under systemd) is done and fully
+verified on this host (2026-09-18).
 
 Full pipeline is: `capture.py` → `coloralg.py` → smoother (circular EMA in
 `ambient.py`) → `ledctl_lib.Strip` (reconnectable BLE writer). All four scripts
-plus `test_coloralg.py`/`test_ambient.py` pass on this host.
+plus `test_coloralg.py`/`test_ambient.py` pass on this host. The daemon is
+installed + enabled as `ambient.service` and running.
 
 Docs live in **`README.md`** (overview) + **`docs/`** (`protocol.md`,
 `usage.md`, `troubleshooting.md`). Keep them in sync when the CLI/flags,
@@ -142,6 +169,10 @@ python3 ledctl.py --mac 41:42:9A:B1:2F:70 rainbow --minutes 30 --brightness 80
 - Frame builders (`color_frame`, `brightness_frame`, `pattern_frame`), constants
   (`CHAR_UUID`, `FRAME_ON/OFF`, `NAMED_COLORS`, `NAME_PREFIXES`), `scan_for_strip`,
   `discover_strips`, `is_strip_name`.
+- `default_socket_path()` — single source of truth for the ambient control
+  socket: `$AMBIENT_SOCKET`, else `$XDG_RUNTIME_DIR/ambient.sock`, else
+  `~/.local/state/ambient/ambient.sock`. Both the daemon and `ambientctl`
+  import it so the two can't drift.
 - `Strip(address)` — self-healing BLE writer the ambient daemon relies on:
   - keeps a background `BleakScanner` running for the link's lifetime so it
     notices a re-advertisement the moment the sleeping device reappears;
@@ -154,24 +185,32 @@ python3 ledctl.py --mac 41:42:9A:B1:2F:70 rainbow --minutes 30 --brightness 80
     BlueZ's `is_connected` is checked before every write, but see the stale-link
     gotcha below for why an always-connected write cadence beats trusting it.
 
-### `ambient.py` — foreground hue-sync daemon (PLAN step 3, verified live)
+### `ambient.py` — hue-sync daemon (PLAN steps 3 + 5, verified live)
 
 ```bash
 python3 ambient.py                                          # auto-scan strip
 python3 ambient.py --mac 41:42:9A:B1:2F:70
 python3 ambient.py --mac 41:42:9A:B1:2F:70 --brightness 80 --tick 0.2
 python3 ambient.py --no-write                               # capture→colour only
+python3 ambient.py --socket /tmp/ambient.sock               # override control socket
 ```
 
 Pipeline: `capture.py` → `coloralg.py` (default `circular`) → circular-EMA
-smoother → `ledctl_lib.Strip`. Two cooperating asyncio tasks:
+smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
 - **producer** captures + computes + smooths, with the wake-on-change
   short-circuit (mean-abs frame delta below `--change-threshold` skips all
-  colour math → idle CPU ≈ 0).
-- **writer** owns BLE: reconnects via `Strip.connect` with backoff, applies the
-  delta-gate (write only when hue arc ≥ `--min-delta`) and a 5 Hz write cap,
+  colour math → idle CPU ≈ 0). Idles fully (no capture) while paused.
+- **writer** owns BLE: reconnects via `Strip.connect` with backoff (a pause
+  mid-retry cancels the attempt and releases the link), applies the delta-gate
+  (write only when hue arc ≥ `--min-delta`), a `--max-step` per-write hue
+  clamp (big changes sweep in bounded steps, no snaps), a 5 Hz write cap,
   always writes the latest hue (drops stale, no queueing). Grey/black frames
   hold the last colour (no strobe).
+- **ctl** Unix-socket control server (path = `ledctl_lib.default_socket_path()`).
+  Line protocol, JSON replies: `status` (paused/connected/address/hue/uptime),
+  `on`/`off` (pause = idle capture + release BLE link, strip holds last colour;
+  resume = reconnect + FRAME_ON + re-sync), `stop` (full shutdown → applies
+  `--stop-state`). Stale socket unlinked on start and on exit.
 - **Heartbeat (replaces the earlier ATT probe; 2026-09-18).** Symptom seen
   live: the strip was changing colour on its *own* (running its built-in
   colour-cycle effect) and ignoring every screen change, while BlueZ still
@@ -189,13 +228,49 @@ smoother → `ledctl_lib.Strip`. Two cooperating asyncio tasks:
   → colour re-synced, all in ~1 s. The strip cannot stall in its own effect
   mode because colour frames arrive every heartbeat or on reconnect.
 - Flags: `--algo --brightness --width/--height --tick --alpha --min-delta
-  --change-threshold --heartbeat --timeout --stop-state off|last --no-write`.
-- On SIGINT/SIGTERM: `--stop-state off` (default) powers the strip off,
-  `last` leaves it on the current colour. (Step 6 will finalise the daemon
-  stop-state decision.)
+  --max-step --change-threshold --heartbeat --timeout --retry --stop-state
+  off|last --no-write --socket`.
+- **Portal-Start hardening (2026-09-18).** The KWin consent handshake (portal
+  `Start`) is a blocking call that can sit unanswered indefinitely. It now runs
+  on a **daemon thread with a cancellable poll**, not the asyncio default
+  executor — a stuck default-executor thread used to be joined by
+  `asyncio.run()`'s shutdown, so `systemctl stop` hit `TimeoutStopSec` and
+  escalated to SIGABRT + core (seen live). Now a stop returns <1 s even
+  mid-handshake (thread is abandoned), and a transient `Start` failure is
+  retried in-place after `--retry` (default 3 s) instead of crash-restarting
+  (`CaptureUnavailableError` still fails fast). Logs go to the journal under
+  systemd via stderr.
+- On SIGINT/SIGTERM/`ambientctl stop`: `--stop-state off` (default) powers the
+  strip off, `last` leaves it on the current colour.
 - `test_ambient.py` covers EMA wrap, arc, frame-delta, hue→rgb, producer
-  tracking/hold, writer power-on + delta gate + heartbeat (fake capture/strip,
-  no hardware).
+  tracking/hold, writer power-on + delta gate + heartbeat, suspend/release/
+  resume, the control socket (real unix socket, status/on/off/unknown) and
+  `default_socket_path` resolution (fake capture/strip, no hardware).
+
+### `ambientctl` — control + systemd install CLI (Step 5)
+
+```bash
+./ambientctl status              # paused?/connected?/hue/uptime  (over the socket)
+./ambientctl on | off | stop     # resume / pause / full shutdown
+./ambientctl install [--mac ADDR]  # writes ~/.config/systemd/user/ambient.service
+./ambientctl enable | disable      # systemctl --user enable|disable --now
+./ambientctl uninstall
+```
+
+- `status`/`on`/`off`/`stop` talk to the daemon's Unix socket — no restart.
+  `off` = pause: sensing stops AND the BLE link is released (single-connection
+  controller is free for a phone app while paused); the strip holds its last
+  colour. `on` = resume: reconnect + re-sync.
+- Socket path: `--socket` flag, else `AMBIENT_SOCKET` env, else
+  `ledctl_lib.default_socket_path()`. Importable module + standalone script
+  (no `.py` suffix; loads via `importlib` when reused in tests).
+- `install` bakes the resolved script path + socket path into the unit;
+  `--mac` bakes a fixed strip address (omit → auto-scan). **Deliberate
+  deviation from PLAN's `Restart=always`: the unit uses `Restart=on-failure`
+  (+ `RestartSec=3`) so a deliberate `ambientctl stop`/`systemctl stop` stays
+  stopped, while crashes / missing-device shortages still restart.**
+  `After=graphical-session.target` + `PartOf=`, `WantedBy=default.target` —
+  lifetime tied to the graphical session, no root needed.
 
 ### `test_device.py` — raw frame tester
 

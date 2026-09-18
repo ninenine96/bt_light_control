@@ -95,7 +95,8 @@ Anti-flicker fundamentals (apply regardless of algorithm):
 ## Autostart (toggleable)
 
 - User-level systemd unit `ambient.service`, `WantedBy=default.target`,
-  `Restart=always`.
+  `Restart=on-failure` (deviation: see build-order step 5 — `always` would
+  resurrect a deliberate `ambientctl stop`).
 - `--user` scope: no root needed. Provide `install.sh`/`uninstall.sh` (or
   `ambientctl enable|disable`) that copies the unit and runs
   `systemctl --user daemon-reload`.
@@ -126,9 +127,29 @@ defaults sane so the daemon runs with zero config.
    via the new `ledctl_lib.py` (refactored out of `ledctl.py`). Unit suite:
    `test_ambient.py`.
 4. Smoothing + thresholding; tune so a changing wallpaper morphs gracefully.
-   — Current defaults in `ambient.py`: `--alpha 0.4`, `--min-delta 0.5°`,
-   `--change-threshold 2.0`. Sandbox with `--no-write` + real capture.
-5. systemd unit + socket control + `enable/disable` toggle.
+    — Current defaults in `ambient.py`: `--alpha 0.4`, `--min-delta 0.5°`,
+    `--max-step 8.0°`, `--change-threshold 2.0`. `--max-step` (2026-09-18)
+    bounds hue per BLE write so large changes sweep (≈40°/s) instead of
+    snapping; with `--no-write`, capture sweeps at exactly 10°/write in tests.
+    Sandbox with `--no-write` + real capture; Step 4 is mostly done pending
+    live tuning across wallpapers.
+5. ✅ systemd unit + socket control + `enable/disable` toggle.
+    — **DONE (2026-09-18):** `ambientctl` (socket CLI + install helper) and the
+    `ambient.py` control server. Verified with a real capture session
+    (dry-run, no BLE): `status`/`on`/`off`/`stop` over the Unix socket, pause
+    idles the capture loop + releases the BLE link, resume reconnects, socket
+    file cleaned up on exit. Offline tests extend `test_ambient.py` to
+    pause/resume + a real unix socket. Unit generator bakes resolved
+    script/socket/MAC paths. **FULLY VERIFIED LIVE (2026-09-18):** installed +
+    enabled, cold-start via `systemctl --user start`, silent consent (restore
+    token), capture + hue sync + auto-reconnect, full socket loop vs the real
+    strip (`status`/`off`/`on`/`stop` → strip off, socket unlinked, service
+    stays `inactive`). One transient: a `Start` hang cleared permanently by
+    `systemctl --user restart xdg-desktop-portal.service`.
+    **Deviation from this step's `Restart=always`:** the unit uses
+    `Restart=on-failure` (+ `RestartSec=3`) so an intentional `ambientctl stop`
+    / `systemctl stop` stays stopped while crashes and a missing/absent device
+    still restart the daemon.
 6. Logging (journald) + reconnect/backoff hardening + stop-state decision
    (current `--stop-state` default = off).
    — Head-start (2026-09-18): the "strip stalls / runs its own colours" bug is
@@ -139,6 +160,14 @@ defaults sane so the daemon runs with zero config.
    the strip awake in solid-colour mode (the `rainbow` path never stalls, proof
    that continuous frames hold the link). If a link still dies, the next write
    raises and the step-3 reconnect/backoff takes over.
+   — **Hardening done (2026-09-18):** the portal `Start` handshake runs on a
+   daemon thread with a cancellable poll + retry (`--retry`, default 3 s). A
+   blocker `Start` (unanswered KWin consent dialog) previously wedged shutdown:
+   asyncio's default executor joins the stuck thread → SIGTERM ignored →
+   systemd TimeoutStopSec → SIGABRT + core dump (seen live). Now `ambientctl
+   stop`/`systemctl stop` returns <1 s even mid-handshake, and a transient
+   portal failure is retried in-place instead of crash-restarting. Logs already
+   go to journald under the unit via stderr.
 
 ## Performance / negligible-tax strategy
 
