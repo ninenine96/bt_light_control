@@ -64,8 +64,10 @@ python3 ambient.py --no-write                               # capture→colour o
 | `--no-write` | off | dry run: compute hue, never touch BLE |
 | `--socket PATH` | auto | control-socket path (default: `$AMBIENT_SOCKET`, else `$XDG_RUNTIME_DIR/ambient.sock`) |
 
-Logs go to stderr. SIGINT/SIGTERM shuts down cleanly into the `--stop-state`
-behaviour.
+Logs go to stderr (captured by journald under systemd with sd-daemon `<N>`
+priorities — hue/heartbeat telemetry is debug, link faults are warnings;
+`journalctl --user -u ambient -p 5` shows the interesting lines).
+SIGINT/SIGTERM shuts down cleanly into the `--stop-state` behaviour.
 
 Tuning tips: sandbox tuning runs with `--no-write` so the strip isn't spammed;
 set `--alpha 1.0` to disable smoothing entirely when debugging.

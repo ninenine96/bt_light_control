@@ -35,9 +35,10 @@ paths.py is the single source of ~/.local/state/ambient/
 | `capture.py` | KWin ScreenCast→PipeWire capture; portal handshake + restore token | gi/GStreamer, paths |
 | `settings.py` | CLI flags, tuned defaults, `reactivity_to_params`/`params_to_reactivity`, `resolve_control`, `state.json` load/save | coloralg, paths |
 | `control_socket.py` | `default_socket_path`, `send_command` (client), `ControlServer` (transport) | stdlib, paths |
-| `daemon.py` | `Daemon`: producer + writer + command semantics (`handle_command`) | capture, coloralg, hue, led_protocol, ble_link, control_socket, settings |
+| `daemon.py` | `Daemon`: producer + writer + command semantics (`handle_command`) | capture, coloralg, hue, led_protocol, ble_link, control_socket, settings, log |
 | `systemd_user.py` | `systemctl --user` wrapper + user-unit install/uninstall | stdlib |
 | `tray_icon.py` | Line-art light-bulb `render_icon` (lazy Qt) | lazy PySide6 |
+| `log.py` | Journald priorities (`<N>` sd-daemon prefixes) + `RateGate` for throttled warnings | stdlib |
 | `ambient.py` | **Entry shim**: `parse_args` → `Daemon(cfg).run()` | daemon, settings, capture |
 | `ambientctl` | Control CLI + systemd install (entry point, no `.py`) | control_socket, systemd_user |
 | `ambienttray` | Tray UI + slider panel + its systemd install (entry point, no `.py`) | control_socket, systemd_user, tray_icon |
@@ -61,6 +62,7 @@ Entry-point filenames are intentionally stable: the installed user units'
 | Socket path / line protocol / client | `control_socket.py` |
 | Tray menu, slider, tooltip, status polling | `ambienttray` |
 | Tray icon artwork | `tray_icon.py` |
+| Log levels / priorities / warning throttling | `log.py` + `daemon.py` |
 | systemd unit text or install flow | `ambientctl` / `ambienttray` + `systemd_user.py` |
 
 ## Conventions / caveats
@@ -72,8 +74,13 @@ Entry-point filenames are intentionally stable: the installed user units'
   `XDG_STATE_HOME` at import (tests isolate it).
 - **Entry points are thin shims**; all logic lives in importable modules.
 - Tests mirror modules: `test_hue.py`, `test_settings.py`, `test_daemon.py`,
-  `test_control_socket.py`, `test_tray.py`, `test_tray_icon.py`,
+  `test_control_socket.py`, `test_tray.py`, `test_tray_icon.py`, `test_log.py`,
   `test_coloralg.py`.  Run them all with `python3 run_tests.py`
   (`test_device.py` is excluded — it talks to real hardware at import).
 - Protocol, operational gotchas and calibration notes live in `AGENTS.md`,
   `docs/protocol.md` and `docs/troubleshooting.md`.
+- **Logging** goes to stderr (→ journald under the units) via `log.py`, which
+  prefixes each line with an sd-daemon `<N>` priority and sets
+  `SyslogIdentifier=ambient|ambienttray` in the units. Per-write hue/heartbeat
+  telemetry is debug; `journalctl --user -u ambient -p warning` shows link
+  faults, `-p 5` life cycle. `RateGate(10)` throttles a reconnect storm.

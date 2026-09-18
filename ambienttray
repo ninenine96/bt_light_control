@@ -163,6 +163,8 @@ Restart=on-failure
 RestartSec=3
 Nice=15
 IOSchedulingClass=idle
+# Attribute logs to `ambienttray`, not the `/usr/bin/env` wrapper.
+SyslogIdentifier=ambienttray
 
 [Install]
 WantedBy=default.target

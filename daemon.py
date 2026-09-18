@@ -38,13 +38,13 @@ from __future__ import annotations
 
 import asyncio
 import signal
-import sys
 import threading
 import time
 
 from bleak.exc import BleakDeviceNotFoundError, BleakError
 
 import capture
+import log
 from ble_link import Strip
 from coloralg import ALGORITHMS
 from control_socket import ControlServer, default_socket_path
@@ -75,6 +75,8 @@ class Daemon:
         self._target: dict | None = None    # latest {"hue": <deg>} from producer
         self._last_written_hue: float | None = None
         self._last_write_t = 0.0
+        # throttle repeated link-fault warnings during a reconnect storm
+        self._link_warn = log.RateGate(10.0)
         self.socket_path = cfg.socket or default_socket_path()
 
     @property
@@ -131,8 +133,8 @@ class Daemon:
             except Exception as exc:
                 if self._stop.is_set():
                     return
-                print(f"[capture] start failed ({type(exc).__name__}): {exc}"
-                      f" \u2014 retrying in {self.cfg.retry}s", file=sys.stderr)
+                log.warning(f"[capture] start failed ({type(exc).__name__}): "
+                            f"{exc} \u2014 retrying in {self.cfg.retry}s")
                 await asyncio.sleep(self.cfg.retry)
                 cap.close()
                 continue
@@ -140,8 +142,8 @@ class Daemon:
                 cap.close()
                 return  # user stopped during the handshake
             break
-        print(f"[ambient] capturing {cap.width}x{cap.height}"
-              f" algo={self.cfg.algo} tick={self.cfg.tick}s", file=sys.stderr)
+        log.info(f"[ambient] capturing {cap.width}x{cap.height}"
+                 f" algo={self.cfg.algo} tick={self.cfg.tick}s")
 
         prev_pixels: list | None = None
         smoothed: float | None = None
@@ -223,7 +225,7 @@ class Daemon:
             if self._paused.is_set():
                 if self.strip.connected:
                     await self.strip.disconnect()
-                    print("[led] paused \u2014 link released", file=sys.stderr)
+                    log.notice("[led] paused \u2014 link released")
                 while not self._stop.is_set() and self._paused.is_set():
                     await asyncio.sleep(0.25)
                 continue
@@ -234,7 +236,7 @@ class Daemon:
                     ok = await self._connect_or_stop()
                     if not ok:
                         continue  # paused mid-connect -> outer loop releases
-                    print(f"[led] connected to {self.strip.address}", file=sys.stderr)
+                    log.notice(f"[led] connected to {self.strip.address}")
                     await self.strip.write(FRAME_ON)
                     self._last_written_hue = None
                     # allow the (re-)synced colour to fire immediately
@@ -242,9 +244,10 @@ class Daemon:
                 except _UserStop:
                     return
                 except (BleakError, ConnectionError, OSError) as exc:
-                    if not self._stop.is_set() and not self._paused.is_set():
-                        print(f"[led] link down ({type(exc).__name__}); retrying...",
-                              file=sys.stderr)
+                    if (not self._stop.is_set() and not self._paused.is_set()
+                            and self._link_warn.ready()):
+                        log.warning(f"[led] link down ({type(exc).__name__}); "
+                                    "retrying...")
                     await asyncio.sleep(1.0)
                     continue
 
@@ -278,13 +281,12 @@ class Daemon:
                         rgb = hue_to_rgb(target, self.cfg.brightness)
                         try:
                             await self.strip.write(color_frame(*rgb))
-                            print(f"[led] heartbeat \u2192 rgb={rgb}",
-                                  file=sys.stderr)
+                            log.debug(f"[led] heartbeat \u2192 rgb={rgb}")
                             self._last_write_t = now
                         except (BleakError, ConnectionError, OSError) as exc:
-                            print(f"[led] heartbeat failed "
-                                  f"({type(exc).__name__}): {exc}",
-                                  file=sys.stderr)
+                            if self._link_warn.ready():
+                                log.warning(f"[led] heartbeat failed "
+                                            f"({type(exc).__name__}): {exc}")
                             break  # let the outer loop reconnect
                     continue
 
@@ -306,17 +308,16 @@ class Daemon:
                 rgb = hue_to_rgb(write_hue, self.cfg.brightness)
                 try:
                     if self.cfg.no_write:
-                        print(f"[led] (dry) hue={write_hue:6.1f}\u00b0 rgb={rgb}",
-                              file=sys.stderr)
+                        log.debug(f"[led] (dry) hue={write_hue:6.1f}\u00b0 rgb={rgb}")
                     else:
                         await self.strip.write(color_frame(*rgb))
-                        print(f"[led] hue={write_hue:6.1f}\u00b0 \u2192 rgb={rgb}",
-                              file=sys.stderr)
+                        log.debug(f"[led] hue={write_hue:6.1f}\u00b0 \u2192 rgb={rgb}")
                     self._last_written_hue = write_hue
                     self._last_write_t = now
                 except (BleakError, ConnectionError, OSError) as exc:
-                    print(f"[led] write failed ({type(exc).__name__}): {exc}",
-                          file=sys.stderr)
+                    if self._link_warn.ready():
+                        log.warning(f"[led] write failed "
+                                    f"({type(exc).__name__}): {exc}")
                     break  # outer loop reconnects
 
     # -- shutdown ---------------------------------------------------------------
@@ -326,15 +327,15 @@ class Daemon:
         if self.cfg.stop_state == "off" and self.strip.connected:
             try:
                 await self.strip.write(FRAME_OFF)
-                print("[led] strip off", file=sys.stderr)
+                log.notice("[led] strip off")
             except Exception as exc:
-                print(f"[led] off write failed: {exc}", file=sys.stderr)
+                log.error(f"[led] off write failed: {exc}")
         elif self.strip.connected:
-            print("[led] left on last colour", file=sys.stderr)
+            log.notice("[led] left on last colour")
         else:
-            print("[led] not connected", file=sys.stderr)
+            log.notice("[led] not connected")
         await self.strip.disconnect()
-        print("[ambient] exiting", file=sys.stderr)
+        log.info("[ambient] exiting")
 
     # -- Unix-socket control (semantics for control_socket.ControlServer) -------
 
@@ -362,19 +363,19 @@ class Daemon:
             }
         if cmd == "on":
             self._paused.clear()
-            print("[ctl] resume (on)", file=sys.stderr)
+            log.notice("[ctl] resume (on)")
             return {"ok": True, "paused": self._paused.is_set()}
         if cmd == "off":
             self._paused.set()
             self._notify.clear()
-            print("[ctl] pause (off)", file=sys.stderr)
+            log.notice("[ctl] pause (off)")
             return {"ok": True, "paused": self._paused.is_set()}
         if cmd == "algo":
             if len(words) < 2 or words[1] not in ALGORITHMS:
                 return {"ok": False,
                         "error": f"algo must be one of: {', '.join(sorted(ALGORITHMS))}"}
             if words[1] != self.cfg.algo:   # avoid noisy log spam on repeat
-                print(f"[ctl] algo -> {words[1]}", file=sys.stderr)
+                log.notice(f"[ctl] algo -> {words[1]}")
             self.cfg.algo = words[1]
             save_control_state(self.cfg.algo, self.cfg.reactivity)
             return {"ok": True, "algo": self.cfg.algo}
@@ -389,15 +390,14 @@ class Daemon:
                 return {"ok": False, "error": "reactivity must be 0-100"}
             self.cfg.reactivity = round(r, 1)
             self.cfg.alpha, self.cfg.max_step = reactivity_to_params(r)
-            print(f"[ctl] reactivity -> {self.cfg.reactivity} "
-                  f"(alpha={self.cfg.alpha} max_step={self.cfg.max_step})",
-                  file=sys.stderr)
+            log.notice(f"[ctl] reactivity -> {self.cfg.reactivity} "
+                       f"(alpha={self.cfg.alpha} max_step={self.cfg.max_step})")
             save_control_state(self.cfg.algo, self.cfg.reactivity)
             return {"ok": True, "reactivity": self.cfg.reactivity,
                     "alpha": self.cfg.alpha, "max_step": self.cfg.max_step}
         if cmd == "stop":
             self.stop()
-            print("[ctl] stop requested", file=sys.stderr)
+            log.notice("[ctl] stop requested")
             return {"ok": True, "stopping": True}
         return {"ok": False, "error": f"unknown command: {line.strip()!r}"}
 

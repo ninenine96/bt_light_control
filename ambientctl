@@ -101,6 +101,9 @@ Restart=on-failure
 RestartSec=3
 Nice=15
 IOSchedulingClass=idle
+# Without this, logs are attributed to `env` (the ExecStart wrapper). Lines
+# carry `<N>` sd-daemon priorities from log.py; SyslogLevelPrefix defaults on.
+SyslogIdentifier=ambient
 
 [Install]
 WantedBy=default.target

@@ -18,15 +18,14 @@ capture → predominant hue → smooth strip drive, toggleable, auto-starting
 are in **`PLAN.md`** — read it before working on this.
 
 Current focus: **Step 4 live tuning** across a range of wallpapers (defaults are
-already tuned in code) and the **Step 6 tail** (journald structured-logging
-review). The tray is **shipped as a user service** (`ambient-tray.service`,
-installed + enabled 2026-09-18).
+already tuned in code). Step 6 is **done** (see below). The tray is **shipped
+as a user service** (`ambient-tray.service`, installed + enabled 2026-09-18).
 
 Standing instruction for every future session: whenever you make progress in
 this endeavour (new files, decisions, findings, gotchas, test results), update
 this AGENTS.md to reflect it.
 
-## Progress status (last update: 2026-09-18)
+## Progress status (last update: 2026-09-19)
 
 Build order from PLAN.md — checked items are done and verified on this host:
 
@@ -65,11 +64,24 @@ Build order from PLAN.md — checked items are done and verified on this host:
       tests in `test_ambient.py` extend to pause/resume + socket.
       Deliberate deviation from PLAN: unit uses `Restart=on-failure` (not
       `always`) so an intentional `ambientctl stop` stays stopped.
-- [~] Step 6 — logging/journald + reconnect/backoff hardening + stop-state.
-      Partially done: portal-Start no longer wedges shutdown (daemon-thread +
-      retry, 2026-09-18) and logs go to journald via stderr; the reconnect
-      backoff + heartbeat hardening landed in Step 3/5. Remaining: journald
-      structured logging review, if any.
+- [x] **Step 6 — logging/journald + reconnect/backoff hardening + stop-state.
+      DONE (2026-09-19).** Portal-Start no longer wedges shutdown (daemon-thread +
+      retry, 2026-09-18), reconnect backoff + heartbeat hardening landed in
+      Step 3/5, and the journald structured-logging review is done: see the
+      `log.py` section below.
+- [x] **Journald logging milestone (2026-09-19)** — daemon logs now carry
+      sd-daemon `<N>` priorities (so `journalctl -p warning` filters) and the
+      generated units set `SyslogIdentifier=ambient`/`ambienttray` (was `env`).
+      High-frequency telemetry is now **debug**: hue writes + heartbeats moved
+      from info→debug (a busy screen previously flooded the journal ~2.8
+      lines/s; default `journalctl` now shows lifecycle + one link warning, and
+      `-p debug` shows the write chatter). `log.RateGate(10s)` collapses a
+      reconnect storm to one `[led] link down (...)` / `write failed` warning
+      (verified live: 60 retries → 1 line). Live-verified on the real strip:
+      `[led] connected` = NOTICE, `[led] hue=` = DEBUG, `[led] write failed
+      (ConnectionError): strip link is down` = WARN, `PRIORITY`/identifier all
+      correct in journald. New `test_log.py` (3) covers prefixes + RateGate; the
+      generated unit was reinstalled with the new identifier.
 - [x] **Tray milestone (2026-09-18)** — `ambienttray` taskbar icon + live
       algorithm switching + reaction-speed slider: added the `algo NAME` and
       `reactivity 0-100` socket commands (validated; `status` now lists `algos`
@@ -117,20 +129,22 @@ Build order from PLAN.md — checked items are done and verified on this host:
       `ledctl_lib.py` into single-responsibility modules for faster agentic
       navigation: `paths.py`, `led_protocol.py`, `ble_link.py`,
       `control_socket.py` (now also hosts `ControlServer`), `hue.py`,
-      `settings.py`, `daemon.py` (class `Ambient` → `Daemon`), `systemd_user.py`
-      and `tray_icon.py`. Entry points `ambient.py`/`ambientctl`/`ambienttray`/
+      `settings.py`, `daemon.py` (class `Ambient` → `Daemon`), `systemd_user.py`,
+      `tray_icon.py` and `log.py` (2026-09-19, journald priorities). Entry
+      points `ambient.py`/`ambientctl`/`ambienttray`/
       `ledctl.py` stay as thin shims so the systemd `ExecStart` paths are
       unchanged. Tests split to mirror modules (`test_hue`, `test_settings`,
-      `test_daemon`, `test_control_socket`, `test_tray`, `test_tray_icon`) plus
-      a new `run_tests.py` runner that excludes the hardware-only
-      `test_device.py`. `docs/ARCHITECTURE.md` added (module map + "to change X,
-      edit Y"). All 7 suites pass.
+      `test_daemon`, `test_control_socket`, `test_tray`, `test_tray_icon`,
+      `test_log`) plus a new `run_tests.py` runner that excludes the
+      hardware-only `test_device.py`. `docs/ARCHITECTURE.md` added (module map +
+      "to change X, edit Y"). All 8 suites pass as of 2026-09-19.
 
 Current milestone: Step 4 tuning (needs live tuning on a range of wallpapers);
 Step 5 (install/enable + live socket control under systemd) is done and fully
 verified on this host (2026-09-18); tray milestone complete + verified live
 against the real strip and **shipped as `ambient-tray.service`** (installed +
-enabled, 2026-09-18).
+enabled, 2026-09-18); Step 6 (journald logging) done + live-verified
+(2026-09-19).
 
 Full pipeline is: `capture.py` → `coloralg.py` → smoother (`hue.py` circular
 EMA, driven by `daemon.py`) → `ble_link.Strip` (reconnectable BLE writer).
@@ -253,6 +267,10 @@ python3 ledctl.py --mac 41:42:9A:B1:2F:70 rainbow --minutes 30 --brightness 80
 - **`systemd_user.py`** — shared `systemctl --user` wrapper + user-unit
   install/uninstall (used by both `ambientctl` and `ambienttray`).
 - **`tray_icon.py`** — `render_icon` line-art bulb (lazy PySide6 import).
+- **`log.py`** — journald-friendly logging: `error`/`warning`/`notice`/`info`/
+  `debug` emit sd-daemon `<N>` priority prefixes on stderr (so
+  `journalctl -p warning` filters) + `RateGate` for throttling repeated
+  warnings. Used by `daemon.py` (see the journald milestone above).
 
 `default_socket_path()` — single source of truth for the ambient control
 socket: `$AMBIENT_SOCKET`, else `$XDG_RUNTIME_DIR/ambient.sock`, else
@@ -350,7 +368,8 @@ asyncio tasks:
   mid-handshake (thread is abandoned), and a transient `Start` failure is
   retried in-place after `--retry` (default 3 s) instead of crash-restarting
   (`CaptureUnavailableError` still fails fast). Logs go to the journal under
-  systemd via stderr.
+  systemd via stderr (sd-daemon `<N>` priority prefixes; see the journald
+  milestone above and `log.py`).
 - On SIGINT/SIGTERM/`ambientctl stop`: `--stop-state off` (default) powers the
   strip off, `last` leaves it on the current colour.
 - Tests are split to mirror modules: `test_hue.py` (EMA wrap, arc, frame-delta,
@@ -359,7 +378,8 @@ asyncio tasks:
   `test_control_socket.py` (real unix socket, status/on/off/algo/reactivity/
   unknown, `send_command` round-trip + failure, `default_socket_path`),
   `test_settings.py` (reactivity↔params mapping, `state.json` save/load +
-  restart precedence). All use fake capture/strip, no hardware.
+  restart precedence), `test_log.py` (priority prefixes, RateGate timing). All
+  use fake capture/strip, no hardware.
 
 ### `ambientctl` — control + systemd install CLI (Step 5)
 

@@ -85,7 +85,10 @@ Check the tuning gates in [usage.md](usage.md):
 - `--alpha` too low for your taste → hue responds sluggishly. Raise it.
 
 Log lines printed to stderr (`[ambient]`, `[capture]`, `[led]`) show exactly
-which stage is stuck.
+which stage is stuck. Under systemd they carry sd-daemon priorities: link-fault
+warnings (`[led] write failed`, `link down`) are `-p warning`; per-write
+`[led] hue=` and heartbeat lines are **debug** (`journalctl --user -u ambient
+-p debug`). A reconnect storm is throttled to one warning per 10 s.
 
 ## PipeWire stalls ("Stream error: target not found")
 

@@ -150,8 +150,14 @@ defaults sane so the daemon runs with zero config.
     `Restart=on-failure` (+ `RestartSec=3`) so an intentional `ambientctl stop`
     / `systemctl stop` stays stopped while crashes and a missing/absent device
     still restart the daemon.
-6. Logging (journald) + reconnect/backoff hardening + stop-state decision
-   (current `--stop-state` default = off).
+6. ✅ Logging (journald) + reconnect/backoff hardening + stop-state decision
+   (default = off). — **DONE (2026-09-19).** The logging tail closed: see the
+   journald milestone in AGENTS.md. Portal-Start never wedges shutdown
+   (daemon-thread + retry, 2026-09-18), reconnect/backoff + heartbeat hardening
+   landed in Step 3/5, and structured logging is done — `log.py` emits
+   sd-daemon `<N>` priorities (hue writes/heartbeats = debug, link faults =
+   warning, throttled by `RateGate`), the units set
+   `SyslogIdentifier=ambient|ambienttray`, live-verified on the real strip.
    — Head-start (2026-09-18): the "strip stalls / runs its own colours" bug is
    already handled — the strip silently drops the radio while BlueZ says
    "connected" because it idles out (~20–60 s without frames). Workaround in the

@@ -153,7 +153,11 @@ algorithm + reaction-speed switching are all built and verified on this host.
 Still on the roadmap:
 
 - [ ] Smoothing/threshold tuning in production across wallpapers (Step 4)
-- [ ] journald structured-logging review (Step 6 tail)
+
+Done beyond the roadmap: journald logging review (Step 6) landed 2026-09-19 —
+daemon logs use sd-daemon `<N>` priorities + `SyslogIdentifier=ambient` and the
+units are reinstalled. View them with
+`journalctl --user -u ambient -p 5`; per-write hue/heartbeat chatter is debug.
 
 ## Docs
 
