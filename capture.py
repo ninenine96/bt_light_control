@@ -30,6 +30,8 @@ import sys
 import threading
 import time
 
+from paths import state_dir, state_file
+
 try:
     from gi.repository import Gio, GLib  # type: ignore
     _GI_OK = True
@@ -46,27 +48,26 @@ REQUEST_IFACE = "org.freedesktop.portal.Request"
 
 # restore_token is single-use and KDE re-prompts unless we feed back the exact
 # token the *previous* Start returned. Persist it so the daemon runs silent
-# after the first grant, without touching any dialog.
-_STATE_DIR = os.path.join(
-    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
-    "ambient",
-)
-_RESTORE_TOKEN_FILE = os.path.join(_STATE_DIR, "restore_token")
+# after the first grant, without touching any dialog.  Path is resolved at call
+# time via paths.state_dir() (not cached) so tests can isolate XDG_STATE_HOME.
+def _restore_token_file() -> str:
+    return state_file("restore_token")
 
 
 def _load_restore_token() -> str:
     try:
-        with open(_RESTORE_TOKEN_FILE, encoding="utf-8") as f:
+        with open(_restore_token_file(), encoding="utf-8") as f:
             return f.read().strip()
     except FileNotFoundError:
         return ""
 
 
 def _save_restore_token(token: str) -> None:
-    os.makedirs(_STATE_DIR, exist_ok=True)
-    with open(_RESTORE_TOKEN_FILE + ".tmp", "w", encoding="utf-8") as f:
+    path = _restore_token_file()
+    os.makedirs(state_dir(), exist_ok=True)
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
         f.write(token)
-    os.replace(_RESTORE_TOKEN_FILE + ".tmp", _RESTORE_TOKEN_FILE)
+    os.replace(path + ".tmp", path)
 
 
 class PortalError(RuntimeError):

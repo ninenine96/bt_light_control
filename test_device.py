@@ -1,14 +1,19 @@
+"""Raw frame tester for calibrating a physical LEDDMX strip (runs on import).
+
+Deliberately minimal and self-contained apart from the UUID/frame constants:
+``color_frame`` takes an explicit channel ``order`` so you can probe a new unit
+for its true RGB channel order (see AGENTS.md "Colours / calibration notes").
+This module executes BLE I/O at import, so it is NOT collected by run_tests.py.
+"""
+
 import asyncio
 import sys
 
 from bleak import BleakClient, BleakScanner
 
-ADDR = "41:42:9A:B1:2F:70"
-SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
-CHAR_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
+from led_protocol import CHAR_UUID, FRAME_OFF, FRAME_ON, SERVICE_UUID
 
-FRAME_ON = bytes([0x7B, 0xFF, 0x04, 0x03, 0xFF, 0xFF, 0xFF, 0xFF, 0xBF])
-FRAME_OFF = bytes([0x7B, 0xFF, 0x04, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0xBF])
+ADDR = "41:42:9A:B1:2F:70"
 
 
 def color_frame(r, g, b, order="rgb"):

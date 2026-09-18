@@ -1,5 +1,6 @@
-"""Tests for ambienttray helpers + the reaction-speed slider panel.
+"""Tests for the ambienttray entry point + the reaction-speed slider panel.
 
+The icon render lives in tray_icon.py and is tested in test_tray_icon.py.
 Qt runs on the offscreen platform, so no display is needed. If PySide6 is not
 installed the Qt-dependent tests are skipped (the socket helpers still run).
 
@@ -43,36 +44,6 @@ def test_send_or_none_offline():
     print("\n[Test] send_or_none returns None when the daemon is down")
     assert send_or_none("status", "/tmp/definitely-not-a-socket.sock") is None
     print("  OK    unreachable socket -> None (no exception)")
-
-
-def test_render_icon():
-    print("\n[Test] line-art icon: white outline + ~20% accent fill")
-    if not HAS_QT:
-        print("  SKIP  PySide6 not installed")
-        return
-    _app()
-    accent = (0, 229, 255)
-    icon = ambienttray.render_icon(accent)
-    assert len(icon.availableSizes()) == len(ambienttray._ICON_SIZES)
-    for size in (16, 32, 64):
-        img = icon.pixmap(size, size).toImage()
-        area = size * size
-        accent_px = white_px = 0
-        for y in range(size):
-            for x in range(size):
-                r, g, b, a = img.pixelColor(x, y).getRgb()
-                if a <= 40:
-                    continue
-                if r > 180 and g > 180 and b > 180:
-                    white_px += 1
-                elif b > 140 and r < 90 and g > 90:
-                    accent_px += 1
-        assert white_px > 0, f"{size}px has no white line-art pixels"
-        frac = accent_px / area
-        assert 0.12 < frac < 0.28, f"{size}px accent fill {frac:.1%} (!= ~20%)"
-        core = img.pixelColor(size // 2, round(size * 9.4 / 24)).getRgb()
-        assert core[2] > 150 and core[0] < 80, f"{size}px fill not accent: {core}"
-    print("  OK    multi-size, white outline + accent fill ~20% of area")
 
 
 def test_speed_panel_sync():
@@ -131,7 +102,6 @@ if __name__ == "__main__":
     import os
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     test_send_or_none_offline()
-    test_render_icon()
     test_speed_panel_sync()
     test_speed_panel_commit_debounced()
     test_speed_panel_ignores_sync_mid_drag()

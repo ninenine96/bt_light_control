@@ -113,21 +113,38 @@ Build order from PLAN.md — checked items are done and verified on this host:
       the `ConnectionResetError` when a client times out mid-reply (journal was
       spamming unhandled-exception tracebacks).
 
+- [x] **Modular refactor (2026-09-19)** — split the flat `ambient.py` +
+      `ledctl_lib.py` into single-responsibility modules for faster agentic
+      navigation: `paths.py`, `led_protocol.py`, `ble_link.py`,
+      `control_socket.py` (now also hosts `ControlServer`), `hue.py`,
+      `settings.py`, `daemon.py` (class `Ambient` → `Daemon`), `systemd_user.py`
+      and `tray_icon.py`. Entry points `ambient.py`/`ambientctl`/`ambienttray`/
+      `ledctl.py` stay as thin shims so the systemd `ExecStart` paths are
+      unchanged. Tests split to mirror modules (`test_hue`, `test_settings`,
+      `test_daemon`, `test_control_socket`, `test_tray`, `test_tray_icon`) plus
+      a new `run_tests.py` runner that excludes the hardware-only
+      `test_device.py`. `docs/ARCHITECTURE.md` added (module map + "to change X,
+      edit Y"). All 7 suites pass.
+
 Current milestone: Step 4 tuning (needs live tuning on a range of wallpapers);
 Step 5 (install/enable + live socket control under systemd) is done and fully
 verified on this host (2026-09-18); tray milestone complete + verified live
 against the real strip and **shipped as `ambient-tray.service`** (installed +
 enabled, 2026-09-18).
 
-Full pipeline is: `capture.py` → `coloralg.py` → smoother (circular EMA in
-`ambient.py`) → `ledctl_lib.Strip` (reconnectable BLE writer). The offline
-suites `test_coloralg.py` (4), `test_ambient.py` (23) and `test_tray.py` (5)
-pass on this host. The daemon is installed + enabled as `ambient.service` and
-running; the tray (`ambienttray`) is run manually for now.
+Full pipeline is: `capture.py` → `coloralg.py` → smoother (`hue.py` circular
+EMA, driven by `daemon.py`) → `ble_link.Strip` (reconnectable BLE writer).
+The codebase was split into single-responsibility modules on 2026-09-19 (see
+the milestone below and `docs/ARCHITECTURE.md` for the map). The offline suites
+run with `python3 run_tests.py` — `test_coloralg.py` (4), `test_hue.py` (5),
+`test_settings.py` (4), `test_daemon.py` (8), `test_control_socket.py` (6),
+`test_tray.py` (4), `test_tray_icon.py` (1) all pass on this host. The daemon is
+installed + enabled as `ambient.service` and running; the tray
+(`ambienttray`) is run manually for now.
 
-Docs live in **`README.md`** (overview) + **`docs/`** (`protocol.md`,
-`usage.md`, `troubleshooting.md`). Keep them in sync when the CLI/flags,
-protocol, or operational gotchas change.
+Docs live in **`README.md`** (overview) + **`docs/`** (`ARCHITECTURE.md` module
+map, `protocol.md`, `usage.md`, `troubleshooting.md`). Keep them in sync when
+the CLI/flags, protocol, module layout, or operational gotchas change.
 
 ## Hardware / environment
 
@@ -172,7 +189,7 @@ Details:
 - **Colour:** `C1..C3` are the channel bytes in the controller's expected order.
   **Verified on this unit: plain `rgb` order.** Send `(r,g,b)` as-is. If a
   future unit shows swapped cols (blue↔green or orange→pink), flip the
-  `COLOR_ORDER` constant in `ledctl.py` (options: rgb, rbg, grb, gbr, brg, bgr).
+  `COLOR_ORDER` constant in `led_protocol.py` (options: rgb, rbg, grb, gbr, brg, bgr).
 - **Brightness:** `pct` 0–100, `b1 = pct*32/100` (both bytes are scaled copies).
 - **Pattern:** `idx` 0–210 (indexes the 200+ "LED LAMP" animated effects).
 - Frames are written once per command; the controller holds state. `rainbow`
@@ -196,8 +213,9 @@ All drop near-gray (sat < 0.12) and near-black (val < 0.08) pixels before comput
 
 ### `ledctl.py` — main CLI (chmod +x)
 
-Protocol/frame-builders/scan now live in **`ledctl_lib.py`** (shared with
-`ambient.py`); `ledctl.py` is CLI-only. Docs above still apply verbatim.
+Protocol/frame-builders live in **`led_protocol.py`** and scan/`Strip` in
+**`ble_link.py`** (both shared with the daemon); `ledctl.py` is CLI-only. Docs
+above still apply verbatim.
 
 ```bash
 python3 ledctl.py --scan                          # find LEDDMX strips
@@ -215,16 +233,34 @@ python3 ledctl.py --mac 41:42:9A:B1:2F:70 rainbow --minutes 30 --brightness 80
   purple, pink, off_black.
 - `rainbow` handles SIGTERM/SIGINT gracefully; strip is left on last colour.
 
-### `ledctl_lib.py` — shared protocol + reconnectable `Strip` (used by ambient)
+### Core modules (split out 2026-09-19 — see `docs/ARCHITECTURE.md`)
 
-- Frame builders (`color_frame`, `brightness_frame`, `pattern_frame`), constants
-  (`CHAR_UUID`, `FRAME_ON/OFF`, `NAMED_COLORS`, `NAME_PREFIXES`), `scan_for_strip`,
-  `discover_strips`, `is_strip_name`.
-- `default_socket_path()` — single source of truth for the ambient control
-  socket: `$AMBIENT_SOCKET`, else `$XDG_RUNTIME_DIR/ambient.sock`, else
-  `~/.local/state/ambient/ambient.sock`. Both the daemon and `ambientctl`
-  import it so the two can't drift.
-- `Strip(address)` — self-healing BLE writer the ambient daemon relies on:
+- **`paths.py`** — `state_dir()`/`state_file()`: one resolution of
+  `$XDG_STATE_HOME|~/.local/state` + `/ambient/`, resolved at **call time**
+  (never cached at import — tests isolate it). Used by `capture.py`,
+  `settings.py`, `control_socket.py`.
+- **`led_protocol.py`** — frame builders (`color_frame`, `brightness_frame`,
+  `pattern_frame`), constants (`CHAR_UUID`, `FRAME_ON/OFF`, `NAMED_COLORS`,
+  `NAME_PREFIXES`, `COLOR_ORDER`), `is_strip_name`.
+- **`ble_link.py`** — `scan_for_strip`, `discover_strips`, `Strip`.
+- **`hue.py`** — pure colour math: `circular_ema`, `circular_arc`,
+  `step_toward_hue`, `frame_change`, `hue_to_rgb`.
+- **`settings.py`** — flags, tuned defaults, `reactivity_to_params`/
+  `params_to_reactivity`, `resolve_control`, `state.json` load/save,
+  `MIN_WRITE_INTERVAL`/`HEARTBEAT_INTERVAL`.
+- **`control_socket.py`** — `default_socket_path()`, `send_command()` (client),
+  `ControlServer` (server transport; calls back into `daemon.Daemon`).
+- **`systemd_user.py`** — shared `systemctl --user` wrapper + user-unit
+  install/uninstall (used by both `ambientctl` and `ambienttray`).
+- **`tray_icon.py`** — `render_icon` line-art bulb (lazy PySide6 import).
+
+`default_socket_path()` — single source of truth for the ambient control
+socket: `$AMBIENT_SOCKET`, else `$XDG_RUNTIME_DIR/ambient.sock`, else
+`$XDG_STATE_HOME|~/.local/state` + `/ambient/ambient.sock`. The daemon,
+`ambientctl` and `ambienttray` all import it so they can't drift.
+
+`Strip(address)` — self-healing BLE writer the ambient daemon relies on:
+
   - keeps a background `BleakScanner` running for the link's lifetime so it
     notices a re-advertisement the moment the sleeping device reappears;
   - `connect(max_wait)` retries with exponential backoff (2→30 s);
@@ -236,7 +272,10 @@ python3 ledctl.py --mac 41:42:9A:B1:2F:70 rainbow --minutes 30 --brightness 80
     BlueZ's `is_connected` is checked before every write, but see the stale-link
     gotcha below for why an always-connected write cadence beats trusting it.
 
-### `ambient.py` — hue-sync daemon (PLAN steps 3 + 5, verified live)
+### `ambient.py` — hue-sync daemon entry point (PLAN steps 3 + 5, verified live)
+
+`ambient.py` is now a thin shim (`parse_args` → `daemon.Daemon(cfg).run()`);
+the implementation lives in **`daemon.py`**.
 
 ```bash
 python3 ambient.py                                          # auto-scan strip
@@ -247,7 +286,8 @@ python3 ambient.py --socket /tmp/ambient.sock               # override control s
 ```
 
 Pipeline: `capture.py` → `coloralg.py` (default `circular`) → circular-EMA
-smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
+smoother → `ble_link.Strip` (all wired in `daemon.py`). Three cooperating
+asyncio tasks:
 - **producer** captures + computes + smooths, with the wake-on-change
   short-circuit (mean-abs frame delta below `--change-threshold` skips all
   colour math → idle CPU ≈ 0). Idles fully (no capture) while paused.
@@ -257,7 +297,8 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
   clamp (big changes sweep in bounded steps, no snaps), a 5 Hz write cap,
   always writes the latest hue (drops stale, no queueing). Grey/black frames
   hold the last colour (no strobe).
-- **ctl** Unix-socket control server (path = `ledctl_lib.default_socket_path()`).
+- **ctl** Unix-socket control server (`control_socket.ControlServer`, path =
+  `control_socket.default_socket_path()`).
   Line protocol, JSON replies: `status` (paused/connected/address/hue/uptime +
   `algo`, the `algos` list, `reactivity`, `alpha`, `max_step`), `on`/`off`
   (pause = idle capture + release BLE link, strip holds last colour; resume =
@@ -295,7 +336,7 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
 - **Persisted live control (2026-09-18).** `algo` + `reactivity` set over the
   socket are written atomically to `state_path()` =
   `$XDG_STATE_HOME|~/.local/state` + `/ambient/state.json`. Startup precedence
-  in `Ambient._resolve_control(cfg)`: explicit CLI flags (`--reactivity`, then
+  in `settings.resolve_control(cfg)`: explicit CLI flags (`--reactivity`, then
   `--alpha`/`--max-step`, then `--algo`) > saved state > `DEFAULT_ALPHA` 0.4 /
   `DEFAULT_MAX_STEP` 8.0 (reactivity 50). `--algo`/`--alpha`/`--max-step` default
   to `None`; `parse_args` uses a `_Formatter` that hides `(default: None)`.
@@ -312,12 +353,13 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
   systemd via stderr.
 - On SIGINT/SIGTERM/`ambientctl stop`: `--stop-state off` (default) powers the
   strip off, `last` leaves it on the current colour.
-- `test_ambient.py` covers EMA wrap, arc, frame-delta, hue→rgb, producer
-  tracking/hold, writer power-on + delta gate + heartbeat, suspend/release/
-  resume, the control socket (real unix socket, status/on/off/algo/reactivity/
-  unknown, `send_command` round-trip + failure), the reactivity↔params mapping,
-  `state.json` save/load + restart precedence + socket persistence, and
-  `default_socket_path` resolution (fake capture/strip, no hardware).
+- Tests are split to mirror modules: `test_hue.py` (EMA wrap, arc, frame-delta,
+  hue→rgb, step clamp), `test_daemon.py` (producer tracking/hold, writer
+  power-on + delta gate + sweep + heartbeat, suspend/release/resume),
+  `test_control_socket.py` (real unix socket, status/on/off/algo/reactivity/
+  unknown, `send_command` round-trip + failure, `default_socket_path`),
+  `test_settings.py` (reactivity↔params mapping, `state.json` save/load +
+  restart precedence). All use fake capture/strip, no hardware.
 
 ### `ambientctl` — control + systemd install CLI (Step 5)
 
@@ -339,10 +381,12 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
   picks it up on the next frame. `reactivity` (0–100) sets both the tracking EMA
   and the per-write transition sweep.
 - Socket path: `--socket` flag, else `AMBIENT_SOCKET` env, else
-  `ledctl_lib.default_socket_path()`. Importable module + standalone script
+  `control_socket.default_socket_path()`. Importable module + standalone script
   (no `.py` suffix; loads via `importlib` when reused in tests). The socket
-  client (`send_command`, JSON reply, socket timeout) lives in `ledctl_lib.py`
-  and is shared with `ambienttray`.
+  client (`send_command`, JSON reply, socket timeout) lives in
+  `control_socket.py` and is shared with `ambienttray`. Unit management
+  (`systemctl --user`, unit path, install/uninstall) lives in
+  `systemd_user.py`, shared with `ambienttray`.
 - `install` bakes the resolved script path + socket path into the unit;
   `--mac` bakes a fixed strip address (omit → auto-scan). **Deliberate
   deviation from PLAN's `Restart=always`: the unit uses `Restart=on-failure`
@@ -393,7 +437,7 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
   Qt's "No Icon set" warning; the click-toggle calls `refresh()` (full status)
   rather than trusting the partial `on`/`off` reply, otherwise the icon
   flickers to "no strip" until the next poll.
-- Shares `ledctl_lib.send_command` / `default_socket_path` with `ambientctl`.
+- Shares `control_socket.send_command` / `default_socket_path` with `ambientctl`.
   No `.py` suffix (loaded via importlib when reused in tests). `test_tray.py`
   (5) exercises the icon render (`render_icon`, multi-size, ~20% accent fill),
   `send_or_none`, and the speed-panel over an offscreen `QApplication`
@@ -465,7 +509,7 @@ print(c.read_frame_pixels()[:3]); c.close()"
   `hue= … → rgb=(…)`). Not a regression — the device really is off.
 - **Scan-vs-connect BlueZ conflict.** BlueZ refuses a `Connect` while any
   discovery session is active (`org.bluez.Error.InProgress`); passive scans are
-  also rejected here unless you pass `or_patterns`. `ledctl_lib.Strip` handles
+  also rejected here unless you pass `or_patterns`. `ble_link.Strip` handles
   both: it uses an active-mode `BleakScanner` to *detect* the device, stops the
   scanner just before each connect attempt, and restarts it during backoff.
   Verified: connects `41:42:9A:B1:2F:70` reliably even mid-sleep.

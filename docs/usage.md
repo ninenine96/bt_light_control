@@ -175,7 +175,7 @@ python3 test_device.py bright:60
 ```
 
 The second argument after `rgb:` overrides the channel order — useful to
-calibrate `COLOR_ORDER` in `ledctl_lib.py` on a new unit. Hard-codes the
+calibrate `COLOR_ORDER` in `led_protocol.py` on a new unit. Hard-codes the
 device address `41:42:9A:B1:2F:70`.
 
 ## Tests
@@ -183,11 +183,20 @@ device address `41:42:9A:B1:2F:70`.
 No hardware needed:
 
 ```bash
-python3 test_coloralg.py     # all 4 algorithms on solid/noisy/gray/band inputs
-python3 test_ambient.py      # EMA arc/delta, producer/writer, socket
-                             # (status/algo/reactivity), reactivity mapping,
-                             # state.json persistence + restart precedence
-python3 test_tray.py         # icon render + send_or_none + speed-panel (offscreen Qt)
+python3 run_tests.py         # every suite below, each in a fresh subprocess
 ```
 
-Both exit non-zero on failure and print `✅ All … passed` on success.
+or individually:
+
+```bash
+python3 test_coloralg.py       # all 4 algorithms on solid/noisy/gray/band inputs
+python3 test_hue.py            # circular EMA/arc/step + hue→rgb
+python3 test_settings.py       # reactivity mapping, state.json, precedence
+python3 test_daemon.py         # producer/writer, gating, heartbeat, pause/resume
+python3 test_control_socket.py # socket path/client + status/on/off/algo/reactivity
+python3 test_tray.py           # send_or_none + speed-panel (offscreen Qt)
+python3 test_tray_icon.py      # line-art icon render (offscreen Qt)
+```
+
+Each exits non-zero on failure and prints `✅ All … passed` on success.
+`test_device.py` is excluded — it talks to real hardware at import.

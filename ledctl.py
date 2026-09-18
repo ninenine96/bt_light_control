@@ -28,7 +28,8 @@ import sys
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakDeviceNotFoundError
 
-from ledctl_lib import (
+from ble_link import scan_for_strip
+from led_protocol import (
     CHAR_UUID,
     FRAME_ON,
     FRAME_OFF,
@@ -37,7 +38,6 @@ from ledctl_lib import (
     brightness_frame,
     color_frame,
     pattern_frame,
-    scan_for_strip,
 )
 
 

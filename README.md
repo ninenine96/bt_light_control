@@ -56,16 +56,23 @@ If `ambient.py --mac …` can't find the device, see
 | Script | Purpose |
 |---|---|
 | `ledctl.py` | CLI: on/off/color/brightness/pattern/rainbow/scan |
-| `ledctl_lib.py` | Shared frame builders, reconnectable `Strip` BLE wrapper, socket path |
-| `ambient.py` | Ambient hue-sync daemon (capture → colour → smoother → strip + control socket) |
+| `led_protocol.py` | Wire protocol: UUIDs, frame builders, colour order |
+| `ble_link.py` | Reconnectable `Strip` BLE link + advertisement scans |
+| `ambient.py` | Ambient hue-sync daemon entry point (capture → colour → smoother → strip + control socket) |
+| `daemon.py` | Daemon task wiring: producer, writer, `handle_command` |
+| `hue.py` | Circular-hue math (EMA, arc, step clamp, hue→rgb) |
+| `settings.py` | Flags, tuned defaults, reaction-speed mapping, persisted state |
+| `control_socket.py` | Control-socket path, client `send_command`, `ControlServer` |
+| `capture.py` | KWin screen capture via xdg-desktop-portal ScreenCast → PipeWire |
+| `coloralg.py` | Four colour algorithms (circular-mean, histogram, k-means, average) |
 | `ambientctl` | Control CLI: `status`/`on`/`off`/`algo`/`stop` + systemd `install`/`enable`/`disable` |
 | `ambienttray` | PySide6 taskbar icon: click to toggle sync, algorithm radio menu, reaction-speed slider |
-| `coloralg.py` | Four colour algorithms (circular-mean, histogram, k-means, average) |
-| `capture.py` | KWin screen capture via xdg-desktop-portal ScreenCast → PipeWire |
 | `test_device.py` | Raw frame tester for protocol/colour-order calibration |
-| `test_coloralg.py`, `test_ambient.py`, `test_tray.py` | Offline unit suites (no hardware) |
 
-Every script's full usage is in [docs/usage.md](docs/usage.md).
+Every script's full usage is in [docs/usage.md](docs/usage.md); the module map
+is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Offline suites
+(`test_hue`, `test_settings`, `test_daemon`, `test_control_socket`, `test_tray`,
+`test_tray_icon`, `test_coloralg`) run with `python3 run_tests.py`.
 
 ## The ambient pipeline
 
@@ -77,7 +84,7 @@ Every script's full usage is in [docs/usage.md](docs/usage.md).
   meaningfully changed, all colour math and BLE activity are skipped, so an
   idle desktop costs ≈ 0% CPU.
 - **Writer** — owns the BLE link. Reconnects with exponential backoff when the
-  strip sleeps (`ledctl_lib.Strip` keeps a background scanner so it notices the
+  strip sleeps (`ble_link.Strip` keeps a background scanner so it notices the
   moment the device re-advertises), applies a delta-gate (only writes when the
   hue moved ≥ ~0.5°) and a ~5 Hz write cap, and always writes the *latest* hue,
   dropping stale frames rather than queueing.

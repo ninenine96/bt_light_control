@@ -24,7 +24,7 @@ link blocks everything else:
 - A previously-killed script (see next section).
 
 Also note BlueZ refuses a `Connect` while **any** discovery scan is active
-(`org.bluez.Error.InProgress` on this host). `ledctl_lib.Strip` handles this by
+(`org.bluez.Error.InProgress` on this host). `ble_link.Strip` handles this by
 stopping its background scanner just before each connect attempt and restarting
 it during backoff; `ledctl.py` one-shot commands don't scan-then-connect, so
 they're unaffected.
@@ -53,7 +53,7 @@ python3 test_device.py rgb:0,255,0 rbg    # try each order until green comes out
 python3 test_device.py rgb:0,128,255 grb
 ```
 
-Then set `COLOR_ORDER` in `ledctl_lib.py` to the order that works (options:
+Then set `COLOR_ORDER` in `led_protocol.py` to the order that works (options:
 `rgb, rbg, grb, gbr, brg, bgr`).
 
 ## Strip colours look muddy / orange looks dim

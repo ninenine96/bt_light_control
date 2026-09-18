@@ -40,7 +40,7 @@ Details:
 - **Colour:** `C1..C3` are written in the controller's expected channel order.
   Verified on this unit: plain **RGB**. If a future unit shows swapped channels
   (blue↔green, or orange→pink on a red frame), flip the `COLOR_ORDER` constant
-  in `ledctl_lib.py` — options are `rgb, rbg, grb, gbr, brg, bgr`. Use
+  in `led_protocol.py` — options are `rgb, rbg, grb, gbr, brg, bgr`. Use
   `test_device.py rgb:255,0,0 <order>` to test each order against the hardware.
 - **Brightness:** `pct` is 0–100; both bytes are scaled copies of the same value.
 - **Pattern:** `idx` indexes the 200+ built-in "LED LAMP" animated effects.
@@ -60,7 +60,7 @@ daemon's write cap).
    the device shows "Connected" in BlueZ but ignores new connections. Recovery
    is `bluetoothctl disconnect <mac> && bluetoothctl remove <mac>`, then rescan.
 
-`ledctl_lib.Strip` automates most of this: it keeps a background scanner so it
+`ble_link.Strip` automates most of this: it keeps a background scanner so it
 notices a re-advertisement the moment it appears, stops the scan just before
 each connect attempt (BlueZ refuses Connect while discovery runs), and retries
 with exponential backoff (2→30 s).
