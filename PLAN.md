@@ -168,6 +168,29 @@ defaults sane so the daemon runs with zero config.
    stop`/`systemctl stop` returns <1 s even mid-handshake, and a transient
    portal failure is retried in-place instead of crash-restarting. Logs already
    go to journald under the unit via stderr.
+7. ✅ Taskbar tray icon + live algorithm switching + reaction-speed slider
+   (extra-milestone, 2026-09-18).
+   — **DONE:** `ambienttray` (PySide6, native Plasma StatusNotifier): left-click
+   toggles sync on/off, menu has a Pause/Resume toggle, a colour-algorithm
+   radio list, and a "Reaction speed …" popup with a 0–100 slider, plus a
+   hue-coloured status dot. Daemon gained the `algo NAME` + `reactivity 0-100`
+   socket commands (validated; `status` now returns `algo`, the `algos` list,
+   `reactivity`, `alpha`, `max_step`) and the producer re-resolves
+   `ALGORITHMS[name]` per frame so switches apply on the next frame. The single
+   reactivity knob maps linearly to BOTH `--alpha` (tracking EMA) and
+   `--max-step` (per-write sweep); R=50 reproduces the tuned defaults exactly.
+   Shared `send_command` moved into `ledctl_lib.py` (ambientctl + tray both use
+   it); `ambientctl algo NAME` + `ambientctl reactivity N` added.
+   **Live-verified under systemd (2026-09-18):** algo + reactivity switches
+   round-trip on the real strip (status echoes them), invalid values rejected,
+   off/on still release+reconnect, tray runs against the live socket (offscreen
+   smoke + connected). Offline suite grew to 19 ambient tests incl.
+   `test_control_socket_algo`, `test_reactivity_mapping`,
+   `test_control_socket_reactivity`, `test_send_command`, plus `test_tray.py`
+   (4) for the speed panel. **Shipped as a user service 2026-09-18**
+   (`ambient-tray.service` installed + enabled). **Gotcha:** the slider is a
+   separate popup, not embedded in the menu — Plasma draws the tray menu over
+   DBusMenu, which can't host arbitrary widgets.
 
 ## Performance / negligible-tax strategy
 

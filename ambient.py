@@ -112,6 +112,37 @@ def hue_to_rgb(hue_deg: float, brightness: float) -> tuple[int, int, int]:
     return round(r * 255), round(g * 255), round(b * 255)
 
 
+# "Reaction speed" slider <-> (alpha, max_step) mapping.  A single 0–100 knob
+# the tray exposes as one slider; R=0 is the smoothest/slowest, R=100 the
+# quickest, and R=50 reproduces the tuned defaults (alpha 0.4, max_step 8.0°).
+# It drives BOTH the tracking EMA (alpha) and the per-write transition sweep
+# (max_step) so "smooth vs quick" is one axis.
+REACTIVITY_ALPHA_RANGE = (0.05, 0.75)
+REACTIVITY_MAX_STEP_RANGE = (1.0, 15.0)
+
+
+def reactivity_to_params(r: float) -> tuple[float, float]:
+    """Map a 0–100 reaction-speed slider to `(alpha, max_step)`."""
+    r = min(100.0, max(0.0, r))
+    a0, a1 = REACTIVITY_ALPHA_RANGE
+    m0, m1 = REACTIVITY_MAX_STEP_RANGE
+    alpha = a0 + (a1 - a0) * (r / 100.0)
+    max_step = m0 + (m1 - m0) * (r / 100.0)
+    return round(alpha, 3), round(max_step, 2)
+
+
+def params_to_reactivity(alpha: float, max_step: float) -> float:
+    """Inverse of `reactivity_to_params` (derived from max_step).
+
+    `max_step == 0` disables the per-write limit, i.e. the fastest setting.
+    """
+    m0, m1 = REACTIVITY_MAX_STEP_RANGE
+    if max_step <= 0:
+        return 100.0
+    r = (max_step - m0) / (m1 - m0) * 100.0
+    return round(min(100.0, max(0.0, r)), 1)
+
+
 class _UserStop(Exception):
     """Ask the writer task to finish because the user requested shutdown."""
 
@@ -123,6 +154,14 @@ class _UserStop(Exception):
 class Ambient:
     def __init__(self, cfg):
         self.cfg = cfg
+        # `--reactivity` is the single reaction-speed knob; when supplied it
+        # derives alpha + max_step. Otherwise seed it from the tuned flags so
+        # `status` always reports a consistent slider position.
+        if getattr(cfg, "reactivity", None) is not None:
+            cfg.reactivity = round(float(cfg.reactivity), 1)
+            cfg.alpha, cfg.max_step = reactivity_to_params(cfg.reactivity)
+        else:
+            cfg.reactivity = params_to_reactivity(cfg.alpha, cfg.max_step)
         self.strip = Strip(cfg.mac)
         self._start = time.monotonic()
         self._stop = asyncio.Event()
@@ -167,7 +206,6 @@ class Ambient:
         return True
 
     async def _producer(self) -> None:
-        algo = ALGORITHMS[self.cfg.algo]
         while True:
             if self._stop.is_set():
                 return
@@ -213,7 +251,8 @@ class Ambient:
                 continue
             prev_pixels = px
 
-            h, s, v = algo(px)
+            # resolve algo per-frame so a live `algo` switch takes effect now
+            h, s, v = ALGORITHMS[self.cfg.algo](px)
             if h == 0.0 and s == 0.0 and v == 0.0:
                 continue  # neutral/gray/black screen — hold last colour
 
@@ -391,7 +430,10 @@ class Ambient:
 
     def _handle_command(self, line: str) -> dict:
         """One control command -> a JSON->serialisable reply."""
-        cmd = line.strip().lower()
+        words = line.strip().lower().split()
+        if not words:
+            return {"ok": False, "error": "empty command"}
+        cmd = words[0]
         if cmd == "status":
             return {
                 "ok": True,
@@ -401,6 +443,10 @@ class Ambient:
                 "hue": self._target["hue"] if self._target else None,
                 "brightness": self.cfg.brightness,
                 "algo": self.cfg.algo,
+                "algos": sorted(ALGORITHMS),
+                "reactivity": self.cfg.reactivity,
+                "alpha": self.cfg.alpha,
+                "max_step": self.cfg.max_step,
                 "stop_state": self.cfg.stop_state,
                 "uptime": round(time.monotonic() - self._start, 1),
             }
@@ -413,6 +459,30 @@ class Ambient:
             self._notify.clear()
             print("[ctl] pause (off)", file=sys.stderr)
             return {"ok": True, "paused": self._paused.is_set()}
+        if cmd == "algo":
+            if len(words) < 2 or words[1] not in ALGORITHMS:
+                return {"ok": False,
+                        "error": f"algo must be one of: {', '.join(sorted(ALGORITHMS))}"}
+            if words[1] != self.cfg.algo:   # avoid noisy log spam on repeat
+                print(f"[ctl] algo -> {words[1]}", file=sys.stderr)
+            self.cfg.algo = words[1]
+            return {"ok": True, "algo": self.cfg.algo}
+        if cmd == "reactivity":
+            if len(words) < 2:
+                return {"ok": False, "error": "usage: reactivity <0-100>"}
+            try:
+                r = float(words[1])
+            except ValueError:
+                return {"ok": False, "error": "reactivity must be a number 0-100"}
+            if not 0.0 <= r <= 100.0:
+                return {"ok": False, "error": "reactivity must be 0-100"}
+            self.cfg.reactivity = round(r, 1)
+            self.cfg.alpha, self.cfg.max_step = reactivity_to_params(r)
+            print(f"[ctl] reactivity -> {self.cfg.reactivity} "
+                  f"(alpha={self.cfg.alpha} max_step={self.cfg.max_step})",
+                  file=sys.stderr)
+            return {"ok": True, "reactivity": self.cfg.reactivity,
+                    "alpha": self.cfg.alpha, "max_step": self.cfg.max_step}
         if cmd == "stop":
             self.stop()
             print("[ctl] stop requested", file=sys.stderr)
@@ -486,6 +556,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="max hue change (deg) per BLE write; bounds transition "
                         "speed so colour changes glide rather than jump "
                         "(0 disables the step limit)")
+    p.add_argument("--reactivity", type=float, default=None,
+                   help="reaction-speed slider 0-100: sets BOTH --alpha and "
+                        "--max-step (0=smooth/slow, 50=tuned defaults, "
+                        "100=quick). Overrides --alpha/--max-step when given; "
+                        "changeable live with `ambientctl reactivity N`")
     p.add_argument("--change-threshold", type=float, default=2.0,
                    help="frame mean-abs-delta below which the screen is 'static' "
                         "(-1 disables the short-circuit)")

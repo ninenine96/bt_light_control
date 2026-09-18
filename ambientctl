@@ -25,12 +25,11 @@ import argparse
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 from pathlib import Path
 
-from ledctl_lib import default_socket_path
+from ledctl_lib import default_socket_path, send_command
 
 SERVICE_FILENAME = "ambient.service"
 
@@ -38,20 +37,6 @@ SERVICE_FILENAME = "ambient.service"
 # ---------------------------------------------------------------------------
 # socket control
 # ---------------------------------------------------------------------------
-
-def send_command(cmd: str, socket_path: str) -> dict:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(5)
-        s.connect(socket_path)
-        s.sendall((cmd + "\n").encode())
-        buf = b""
-        while not buf.endswith(b"\n"):
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-    return json.loads(buf)
-
 
 def _do_socket_cmd(cmd: str, socket_path: str) -> int:
     try:
@@ -61,6 +46,9 @@ def _do_socket_cmd(cmd: str, socket_path: str) -> int:
               file=sys.stderr)
         print("  Is it running? (check: systemctl --user status ambient)",
               file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as exc:
+        print(f"error: malformed daemon reply: {exc}", file=sys.stderr)
         return 1
     if not resp.get("ok"):
         print(f"error: {resp.get('error', 'unknown reply')}", file=sys.stderr)
@@ -72,6 +60,8 @@ def _do_socket_cmd(cmd: str, socket_path: str) -> int:
         print(f"address:       {resp.get('address') or '(not linked)'}")
         print(f"target hue:    {('%.1f deg' % hue) if hue is not None else '(none yet)'}")
         print(f"brightness:    {resp.get('brightness')}%   algo: {resp.get('algo')}")
+        print(f"reactivity:    {resp.get('reactivity')}/100 "
+              f"(alpha {resp.get('alpha')}, max-step {resp.get('max_step')}°)")
         print(f"stop-state:    {resp.get('stop_state')}")
         print(f"uptime:        {resp.get('uptime')} s")
     elif cmd == "off":
@@ -80,6 +70,11 @@ def _do_socket_cmd(cmd: str, socket_path: str) -> int:
         print("ambient resumed")
     elif cmd == "stop":
         print("stop requested")
+    elif cmd.startswith("algo"):
+        print(f"algorithm:     {resp.get('algo')}")
+    elif cmd.startswith("reactivity"):
+        print(f"reactivity:    {resp.get('reactivity')}/100 "
+              f"(alpha {resp.get('alpha')}, max-step {resp.get('max_step')}°)")
     return 0
 
 
@@ -156,12 +151,25 @@ def main(argv=None) -> int:
     p.add_argument("--mac", default=None,
                    help="strip MAC to bake into the installed unit (default: auto-scan)")
     p.add_argument("command", nargs="?",
-                   help="status|on|off|stop|install|enable|disable|uninstall")
+                   help="status|on|off|algo NAME|reactivity 0-100|stop|"
+                        "install|enable|disable|uninstall")
+    p.add_argument("value", nargs="?",
+                   help="algorithm name (`algo`) or 0-100 level (`reactivity`)")
     args = p.parse_args(argv)
 
     unit = _unit_path()
     if args.command in ("status", "on", "off", "stop"):
         return _do_socket_cmd(args.command, args.socket)
+    if args.command == "algo":
+        if not args.value:
+            print("error: usage: ambientctl algo NAME", file=sys.stderr)
+            return 1
+        return _do_socket_cmd(f"algo {args.value}", args.socket)
+    if args.command == "reactivity":
+        if args.value is None:
+            print("error: usage: ambientctl reactivity 0-100", file=sys.stderr)
+            return 1
+        return _do_socket_cmd(f"reactivity {args.value}", args.socket)
     if args.command == "install":
         return _do_install(args.mac, unit)
     if args.command == "enable":

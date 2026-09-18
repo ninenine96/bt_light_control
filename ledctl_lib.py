@@ -24,7 +24,9 @@ Protocol (9-byte frames, framing 7B ... BF), written to char 0xFFE1:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import socket
 import time
 from pathlib import Path
 
@@ -47,6 +49,25 @@ def default_socket_path() -> str:
     if rt:
         return os.path.join(rt, AMBIENT_SOCKET_NAME)
     return str(Path.home() / ".local" / "state" / "ambient" / AMBIENT_SOCKET_NAME)
+
+
+def send_command(cmd: str, socket_path: str, timeout: float = 5.0) -> dict:
+    """Send one line-protocol command to the ambient daemon and read its reply.
+
+    Raises FileNotFoundError/ConnectionRefusedError/OSError when the daemon is
+    not reachable; JSONDecodeError when the reply is malformed.
+    """
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(socket_path)
+        s.sendall((cmd + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    return json.loads(buf)
 
 SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
 CHAR_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"

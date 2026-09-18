@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Taskbar tray icon for the ambient hue-sync daemon (KDE Plasma / PySide6).
+
+Shows the current strip hue as a coloured dot, lets you pause/resume the
+sync with one click, and switch the colour algorithm from a menu — all live
+over the daemon's Unix control socket (ledctl_lib.default_socket_path).
+
+    ambienttray                # run the tray (in the foreground)
+    ambienttray --socket P     # override control-socket path
+    ambienttray install        # write ~/.config/systemd/user/ambient-tray.service
+    ambienttray enable         # systemctl --user enable --now ambient-tray.service
+    ambienttray disable        # systemctl --user disable --now ambient-tray.service
+    ambienttray uninstall      # remove the unit + daemon-reload
+
+Left-click the tray icon toggles the sync on/off; right-click opens a menu
+with the face status, a Pause/Resume toggle, the algorithm radio list, and
+Start/Stop daemon actions.  The daemon does not need to be running: the tray
+keeps living and offers to start the systemd unit (or stop it).
+
+Requires PySide6 (TrayIcon -> native StatusNotifier on Plasma).
+"""
+
+import argparse
+import shutil
+import sys
+from pathlib import Path
+
+from ledctl_lib import default_socket_path, send_command
+
+_SERVICE_FILENAME = "ambient-tray.service"
+# how often to refresh from the daemon socket, seconds
+_POLL_INTERVAL_MS = 1000
+
+
+def send_or_none(cmd: str, socket_path: str) -> dict | None:
+    """send_command, but return None when the daemon is unreachable."""
+    try:
+        return send_command(cmd, socket_path)
+    except Exception:
+        return None
+
+
+def _status(socket_path: str) -> dict | None:
+    return send_or_none("status", socket_path)
+
+
+def _set_on(socket_path: str, on: bool) -> dict | None:
+    return send_or_none("on" if on else "off", socket_path)
+
+
+def _set_algo(socket_path: str, algo: str) -> dict | None:
+    return send_or_none(f"algo {algo}", socket_path)
+
+
+def _set_reactivity(socket_path: str, level: float) -> dict | None:
+    return send_or_none(f"reactivity {level}", socket_path)
+
+
+def _build_speed_panel(on_commit):
+    """Create the reaction-speed slider widget (Qt imported lazily).
+
+    Plasma renders the tray menu over DBusMenu, which cannot host arbitrary
+    widgets, so the slider lives in its own small tool window opened from the
+    menu rather than embedded in the QMenu.
+
+    `on_commit(level)` is called (debounced) once the user settles on a value.
+    The returned widget exposes `.sync(level, alpha, max_step)` to reflect the
+    daemon's current state without echo-looping back a socket write.
+    """
+    from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtGui import QCursor
+    from PySide6.QtWidgets import (
+        QHBoxLayout, QLabel, QSlider, QVBoxLayout, QWidget,
+    )
+
+    class SpeedPanel(QWidget):
+        def __init__(self) -> None:
+            super().__init__(None, Qt.Tool | Qt.WindowStaysOnTopHint)
+            self.setWindowTitle("Reaction speed")
+            self.setFixedWidth(280)
+            self.dragging = False
+            lay = QVBoxLayout(self)
+            title = QLabel("Reaction speed")
+            f = title.font()
+            f.setBold(True)
+            title.setFont(f)
+            self.slider = QSlider(Qt.Horizontal)
+            self.slider.setRange(0, 100)
+            self.slider.setValue(50)
+            self.value_lbl = QLabel("50 / 100")
+            self.value_lbl.setAlignment(Qt.AlignCenter)
+            hint = QHBoxLayout()
+            hint.addWidget(QLabel("smooth"))
+            hint.addStretch(1)
+            hint.addWidget(QLabel("quick"))
+            lay.addWidget(title)
+            lay.addWidget(self.slider)
+            lay.addWidget(self.value_lbl)
+            lay.addLayout(hint)
+
+            # debounce: only send to the daemon once the user pauses dragging
+            self.send_timer = QTimer(self)
+            self.send_timer.setSingleShot(True)
+            self.send_timer.setInterval(120)
+            self.send_timer.timeout.connect(self._send)
+            self.slider.valueChanged.connect(self._on_change)
+            self.slider.sliderPressed.connect(self._on_press)
+
+        def _on_press(self) -> None:
+            self.dragging = True
+
+        def _on_change(self, value: int) -> None:
+            self.value_lbl.setText(f"{value} / 100")
+            self.send_timer.start()
+
+        def _send(self) -> None:
+            self.send_timer.stop()
+            self.dragging = False
+            on_commit(self.slider.value())
+
+        def show_at_cursor(self) -> None:
+            self.adjustSize()
+            self.move(QCursor.pos() - self.rect().center())
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+        def sync(self, level, alpha, max_step) -> None:
+            """Reflect daemon state, unless the user is mid-drag."""
+            if self.dragging or level is None:
+                return
+            self.slider.blockSignals(True)
+            self.slider.setValue(int(round(level)))
+            self.slider.blockSignals(False)
+            if alpha is not None and max_step is not None:
+                self.value_lbl.setText(
+                    f"{int(round(level))} / 100   \u03b1 {alpha:g}   "
+                    f"{max_step:g}\u00b0/write")
+            else:
+                self.value_lbl.setText(f"{int(round(level))} / 100")
+
+    return SpeedPanel()
+
+
+def _stop_daemon(socket_path: str) -> dict | None:
+    return send_or_none("stop", socket_path)
+
+
+def _systemctl(args: list[str]) -> None:
+    shutil.which("systemctl") or sys.exit("error: systemctl not found")
+    import subprocess
+    subprocess.run(["systemctl", "--user", *args], check=True)
+
+
+def _unit_path() -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / _SERVICE_FILENAME
+
+
+def _build_unit(socket_path: str) -> str:
+    script = Path(__file__).resolve()
+    return f"""# Generated by `ambienttray install` — manage with ambienttray / systemctl --user
+[Unit]
+Description=Ambient hue-sync tray icon
+After=graphical-session.target ambient.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 {script} --socket {socket_path}
+Restart=on-failure
+RestartSec=3
+Nice=15
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def _do_install(socket_path: str) -> int:
+    unit = _unit_path()
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text(_build_unit(socket_path))
+    _systemctl(["daemon-reload"])
+    print(f"installed user unit: {unit}")
+    print("next:  ambienttray enable")
+    return 0
+
+
+def _do_uninstall() -> int:
+    _systemctl(["disable", _SERVICE_FILENAME])
+    unit = _unit_path()
+    if unit.exists():
+        unit.unlink()
+        _systemctl(["daemon-reload"])
+        print(f"removed {unit}")
+    else:
+        print("no unit file present")
+    return 0
+
+
+def _run_tray(socket_path: str) -> int:
+    """Build and run the PySide6 tray icon (blocks until the tray closes)."""
+    from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
+    from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+
+    from coloralg import ALGORITHMS
+
+    app = QApplication(sys.argv[:1])
+    app.setQuitOnLastWindowClosed(False)
+
+    icon = QSystemTrayIcon()
+    icon.setToolTip("ambient hue sync \u2026")
+
+    menu = QMenu()
+
+    # --- actions ----------------------------------------------------------
+    dash = QAction("status \u2026", menu)
+    dash.setEnabled(False)
+    menu.addAction(dash)
+
+    toggle = QAction("Pause sync", menu)
+    toggle.setCheckable(True)
+    toggle.setChecked(False)  # checked = syncing (running); greyed when offline
+    menu.addAction(toggle)
+
+    algo_menu = QMenu("Colour algorithm", menu)
+    algo_actions: dict[str, QAction] = {}
+    for name in sorted(ALGORITHMS):
+        act = QAction(name, algo_menu)
+        act.setCheckable(True)
+        algo_actions[name] = act
+        algo_menu.addAction(act)
+    menu.addMenu(algo_menu)
+
+    speed_act = QAction("Reaction speed \u2026", menu)
+    menu.addAction(speed_act)
+
+    menu.addSeparator()
+
+    start = QAction("Start daemon", menu)
+    stop = QAction("Stop daemon", menu)
+    menu.addAction(start)
+    menu.addAction(stop)
+
+    quit_act = QAction("Quit", menu)
+    menu.addAction(quit_act)
+
+    icon.setContextMenu(menu)
+
+    # --- tiny palette for the status dot -----------------------------------
+    def brush_colour(hue_deg: float | None, running: bool, linked: bool) -> QColor:
+        if not running:
+            return QColor(0x7A, 0x7A, 0x7A)      # gray: paused / offline
+        if not linked:
+            return QColor(0xE0, 0x91, 0x00)      # amber: running, no strip
+        if hue_deg is None:
+            return QColor(0x88, 0xD0, 0x88)      # green: ready, no hue yet
+        h = (hue_deg % 360.0) / 360.0
+        return QColor.fromHsvF(h, 0.95, 0.95)
+
+    def make_icon(colour: QColor) -> QIcon:
+        pm = QPixmap(16, 16)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(colour)
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(2, 2, 12, 12)
+        p.end()
+        return QIcon(pm)
+
+    # --- state + refresh ----------------------------------------------------
+    state: dict = {"online": False, "running": False, "linked": False,
+                   "hue": None, "algo": None, "reactivity": None,
+                   "alpha": None, "max_step": None}
+
+    # --- reaction-speed slider ---------------------------------------------
+    def _commit_reactivity(level: int) -> None:
+        _set_reactivity(socket_path, level)
+        refresh()  # reactivity reply is partial; re-read the full status
+
+    speed_panel = _build_speed_panel(_commit_reactivity)
+
+    def apply_status(resp: dict | None) -> None:
+        online = resp is not None
+        running = bool(resp.get("paused") is False) if online else False
+        linked = bool(resp.get("connected")) if online else False
+        hue = resp.get("hue") if online else None
+        algo = resp.get("algo") if online else None
+        reactivity = resp.get("reactivity") if online else None
+        alpha = resp.get("alpha") if online else None
+        max_step = resp.get("max_step") if online else None
+
+        # keep locally-known values as a graceful fallback when offline
+        if online:
+            state.update(online=True, running=running, linked=linked,
+                         hue=hue, algo=algo, reactivity=reactivity,
+                         alpha=alpha, max_step=max_step)
+        else:
+            state["online"] = False
+
+        colour = brush_colour(state["hue"], state["running"], state["linked"])
+        icon.setIcon(make_icon(colour))
+
+        if online:
+            hue_txt = f"{state['hue']:.0f}\u00b0" if state["hue"] is not None else "n/a"
+            link = "linked" if state["linked"] else "no strip"
+            react_txt = (f" \u00b7 R{state['reactivity']:g}"
+                         if state["reactivity"] is not None else "")
+            icon.setToolTip(
+                f"ambient hue sync \u2014 {'paused' if not state['running'] else 'running'} "
+                f"\u00b7 {hue_txt} \u00b7 {link} \u00b7 {state['algo']}{react_txt}")
+            toggle.setEnabled(True)
+            toggle.setChecked(state["running"])
+            toggle.setText("Resume sync" if not state["running"] else "Pause sync")
+            start.setEnabled(False)
+            stop.setEnabled(True)
+            for name, act in algo_actions.items():
+                act.setChecked(name == state["algo"])
+            speed_act.setEnabled(True)
+            if state["reactivity"] is not None:
+                speed_act.setText(f"Reaction speed \u2026  (R{state['reactivity']:g})")
+            speed_panel.sync(state["reactivity"], state["alpha"], state["max_step"])
+        else:
+            icon.setToolTip("ambient \u2014 daemon not reachable")
+            toggle.setEnabled(False)
+            toggle.setText("Pause sync")
+            start.setEnabled(True)
+            stop.setEnabled(False)
+            speed_act.setEnabled(False)
+
+    def refresh() -> None:
+        apply_status(_status(socket_path))
+
+    apply_status(_status(socket_path))  # immediate first paint (sets the icon)
+    icon.setVisible(True)               # only now that an icon exists
+    poll = QTimer()
+    poll.timeout.connect(refresh)
+    poll.start(_POLL_INTERVAL_MS)
+
+    def _toggle() -> None:
+        # checkable action fired ONLY by a real click (not refresh setChecked):
+        # `triggered` fires for user interactions, `toggled` would also fire
+        # when apply_status() re-syncs the checkbox during a poll.
+        _set_on(socket_path, toggle.isChecked())
+        refresh()  # on/off replies are partial; re-read the full status
+
+    def _choose_algo() -> None:
+        for name, act in algo_actions.items():
+            if act.isChecked() and name != state["algo"]:
+                _set_algo(socket_path, name)
+        refresh()
+
+    def _do_start() -> None:
+        _systemctl(["start", "ambient.service"])
+        refresh()
+
+    def _do_stop() -> None:
+        _stop_daemon(socket_path)
+        refresh()
+
+    toggle.triggered.connect(_toggle)
+    for act in algo_actions.values():
+        act.triggered.connect(_choose_algo)
+    speed_act.triggered.connect(speed_panel.show_at_cursor)
+    start.triggered.connect(_do_start)
+    stop.triggered.connect(_do_stop)
+    quit_act.triggered.connect(app.quit)
+
+    # left-click == toggle (and don't fight the menu's right-click)
+    def _on_activated(reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            if state["online"]:
+                target = not state["running"]
+                _set_on(socket_path, target)
+                refresh()  # on/off replies are partial; re-read full status
+
+    icon.activated.connect(_on_activated)
+
+    return app.exec()
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(
+        description="Tray icon controlling the ambient hue-sync daemon.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--socket", default=default_socket_path(),
+                   help="control socket path")
+    p.add_argument("command", nargs="?",
+                   help="(run, or) install|enable|disable|uninstall")
+    args = p.parse_args(argv)
+
+    if args.command == "install":
+        return _do_install(args.socket)
+    if args.command == "enable":
+        _systemctl(["enable", "--now", _SERVICE_FILENAME])
+        print("enabled + started")
+        return 0
+    if args.command == "disable":
+        _systemctl(["disable", "--now", _SERVICE_FILENAME])
+        print("disabled + stopped")
+        return 0
+    if args.command == "uninstall":
+        return _do_uninstall()
+    if args.command not in (None, "run"):
+        print(f"error: unknown command {args.command!r}", file=sys.stderr)
+        return 2
+    try:
+        return _run_tray(args.socket)
+    except ImportError as exc:
+        print(f"error: {exc}\n  Is PySide6 installed? "
+              "(pip install --user PySide6)", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

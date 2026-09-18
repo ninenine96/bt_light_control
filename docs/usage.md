@@ -57,6 +57,7 @@ python3 ambient.py --no-write                               # capture→colour o
 | `--alpha F` | 0.4 | hue EMA factor (0–1); higher = more responsive |
 | `--min-delta DEG` | 0.5 | min hue arc (°) to trigger a BLE write |
 | `--max-step DEG` | 8.0 | max hue change (°) per BLE write — bounds transition speed so colour changes glide; `0` disables |
+| `--reactivity N` | unset | reaction-speed slider 0–100: sets BOTH `--alpha` and `--max-step` (`0`=smooth/slow, `50`=tuned defaults, `100`=quick). Overrides `--alpha`/`--max-step` when given; changeable live |
 | `--change-threshold F` | 2.0 | frame mean-abs-delta below which the screen is "static"; `-1` disables the short-circuit |
 | `--timeout S` | 60.0 | seconds to keep retrying a lost BLE link |
 | `--stop-state` | `off` | `off` powers the strip down on exit; `last` leaves it on the current colour |
@@ -75,6 +76,8 @@ set `--alpha 1.0` to disable smoothing entirely when debugging.
 python3 ambientctl status          # paused?/connected?/hue/uptime
 python3 ambientctl on              # resume ambient (reconnect strip)
 python3 ambientctl off             # pause: release BLE link, hold last colour
+python3 ambientctl algo histogram  # switch colour algorithm live
+python3 ambientctl reactivity 70   # reaction-speed slider: alpha + max-step
 python3 ambientctl stop            # shut the daemon down (apply --stop-state)
 
 python3 ambientctl install [--mac ADDR]   # write ~/.config/systemd/user/ambient.service
@@ -83,10 +86,14 @@ python3 ambientctl disable               # systemctl --user disable --now ambien
 python3 ambientctl uninstall             # remove the unit
 ```
 
-- `on`/`off`/`status`/`stop` talk to the daemon over the control socket — no
-  restart needed. `off` pauses sensing *and* drops the BLE link (the strip
-  holds its last colour); the single-connection controller is free for a phone
-  app while paused.
+- `on`/`off`/`status`/`algo NAME`/`reactivity N`/`stop` talk to the daemon over
+  the control socket — no restart needed. `off` pauses sensing *and* drops the
+  BLE link (the strip holds its last colour); the single-connection controller
+  is free for a phone app while paused. `algo` validation errors list the
+  available algorithms, and `status` reports the active `algo` (plus the full
+  `algos` list) and `reactivity`/`alpha`/`max_step`. `reactivity` (0–100) is a
+  single smooth↔quick axis that sets both the tracking EMA and the per-write
+  transition sweep (`50` = the tuned defaults).
 - The socket lives at `$AMBIENT_SOCKET`, else `$XDG_RUNTIME_DIR/ambient.sock`
   (falls back to `~/.local/state/ambient/ambient.sock`). Point the CLI
   elsewhere with `--socket PATH` / the `AMBIENT_SOCKET` env var.
@@ -97,6 +104,31 @@ python3 ambientctl uninstall             # remove the unit
   missing device restarts it every 3 s.
 - Lifetime is tied to your graphical session (`PartOf=graphical-session.target`,
   `WantedBy=default.target`).
+
+## `ambienttray` — taskbar tray icon
+
+```bash
+python3 ambienttray                    # run the tray (foreground)
+python3 ambienttray --socket /tmp/a.sock
+python3 ambienttray install            # write ~/.config/systemd/user/ambient-tray.service
+python3 ambienttray enable             # systemctl --user enable --now ambient-tray
+python3 ambienttray disable            # systemctl --user disable --now ambient-tray
+python3 ambienttray uninstall
+```
+
+- PySide6 tray icon (native StatusNotifier on Plasma). **Left-click** toggles
+  ambient sync on/off; **right-click** menu has a Pause/Resume toggle, a
+  Colour-algorithm radio list (from `coloralg.ALGORITHMS`), a **Reaction
+  speed …** slider popup, and Start/Stop-daemon actions.
+- The **reaction-speed slider** (0–100, smooth/slow ↔ quick/responsive) sets
+  both the tracking EMA and the per-write transition sweep, so it's the same as
+  `ambientctl reactivity N`. It opens in a small popup window rather than inside
+  the menu, because Plasma renders tray menus over DBusMenu which cannot host
+  arbitrary widgets.
+- The tray polls the daemon's control socket every 1 s and is fully
+  independent of the pipeline — it keeps living (and can start the daemon)
+  while the daemon is down. Requires PySide6:
+  `pip install --user PySide6`.
 
 ## `capture.py` — screen capture self-test
 
@@ -145,7 +177,9 @@ No hardware needed:
 
 ```bash
 python3 test_coloralg.py     # all 4 algorithms on solid/noisy/gray/band inputs
-python3 test_ambient.py      # EMA wrap, arc, frame-delta, hue→rgb, producer/writer, control socket
+python3 test_ambient.py      # EMA arc/delta, producer/writer, socket
+                             # (status/algo/reactivity), reactivity mapping
+python3 test_tray.py         # send_or_none + tray speed-panel (offscreen Qt)
 ```
 
 Both exit non-zero on failure and print `✅ All … passed` on success.

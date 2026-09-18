@@ -19,7 +19,7 @@ from ambient import (
     parse_args,
     step_toward_hue,
 )
-from ledctl_lib import FRAME_ON, color_frame, default_socket_path
+from ledctl_lib import FRAME_ON, color_frame, default_socket_path, send_command
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +417,122 @@ def test_control_socket():
     print("  OK    status/on/off round-trip, unknown-command rejected, socket removed")
 
 
+def test_control_socket_algo():
+    print("\n[Test] control socket: algo switch live over the socket")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = parse_args(["--no-write", "--mac", "AA:BB:CC:DD:EE:FF"])
+        a = Ambient(cfg)
+        a.socket_path = os.path.join(tmp, "ambient-test.sock")
+
+        async def go():
+            task = asyncio.create_task(a._ctl_server())
+            await asyncio.sleep(0.15)
+            try:
+                # unknown algo -> error, algo stays unchanged
+                bad = await asyncio.to_thread(_sock_cmd, a.socket_path, "algo nope")
+                assert bad["ok"] is False
+                assert "algo" in bad["error"]
+                st = await asyncio.to_thread(_sock_cmd, a.socket_path, "status")
+                assert st["algo"] == "circular"
+                assert st["algos"] == ["average", "circular", "histogram", "kmeans"]
+
+                # valid switch
+                ok = await asyncio.to_thread(_sock_cmd, a.socket_path, "algo histogram")
+                assert ok["ok"] and ok["algo"] == "histogram"
+                assert (await asyncio.to_thread(_sock_cmd, a.socket_path, "status"))["algo"] \
+                    == "histogram"
+
+                # report lists every registered algorithm for the tray menu
+                from coloralg import ALGORITHMS
+                assert set(st["algos"]) == set(ALGORITHMS)
+            finally:
+                a.stop()
+                await task
+
+        asyncio.run(go())
+    print("  OK    algo validated, switched, reported, and listed")
+
+
+def test_reactivity_mapping():
+    print("\n[Test] reactivity <-> (alpha, max-step) mapping")
+    from ambient import params_to_reactivity, reactivity_to_params
+    # the tuned default pair sits exactly at the slider midpoint
+    assert reactivity_to_params(50) == (0.4, 8.0)
+    a0, m0 = reactivity_to_params(0)
+    a1, m1 = reactivity_to_params(100)
+    assert a0 < a1 and m0 < m1, "reaction speed must increase monotonically"
+    assert params_to_reactivity(0.4, 8.0) == 50.0
+    assert params_to_reactivity(0.4, 0) == 100.0   # 0 disables the step limit
+    for r in (0, 25, 50, 75, 100):
+        alpha, ms = reactivity_to_params(r)
+        assert abs(params_to_reactivity(alpha, ms) - r) < 0.5, r
+    print("  OK    R=50 -> alpha 0.4 / max-step 8.0; monotonic; invertible")
+
+
+def test_control_socket_reactivity():
+    print("\n[Test] control socket: reactivity slider live over the socket")
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = parse_args(["--no-write", "--mac", "AA:BB:CC:DD:EE:FF"])
+        a = Ambient(cfg)
+        a.socket_path = os.path.join(tmp, "ambient-test.sock")
+
+        async def go():
+            task = asyncio.create_task(a._ctl_server())
+            await asyncio.sleep(0.15)
+            try:
+                st = await asyncio.to_thread(_sock_cmd, a.socket_path, "status")
+                assert st["reactivity"] == 50.0
+                assert st["alpha"] == 0.4 and st["max_step"] == 8.0
+
+                ok = await asyncio.to_thread(_sock_cmd, a.socket_path, "reactivity 80")
+                assert ok["ok"] and ok["reactivity"] == 80.0
+                st2 = await asyncio.to_thread(_sock_cmd, a.socket_path, "status")
+                assert st2["reactivity"] == 80.0
+                assert st2["alpha"] == 0.61 and st2["max_step"] == 12.2
+
+                for bad in ("reactivity", "reactivity abc", "reactivity 150",
+                            "reactivity -1"):
+                    r = await asyncio.to_thread(_sock_cmd, a.socket_path, bad)
+                    assert r["ok"] is False, bad
+            finally:
+                a.stop()
+                await task
+
+        asyncio.run(go())
+    print("  OK    status reports R/alpha/max-step; set + validation round-trip")
+
+
+def test_send_command():
+    print("\n[Test] ledctl_lib.send_command: JSON reply + failure raises")
+    with tempfile.TemporaryDirectory() as tmp:
+        sock = os.path.join(tmp, "echo.sock")
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(sock)
+        srv.listen(1)
+
+        def echo():
+            conn, _ = srv.accept()
+            with conn:
+                data = conn.recv(4096)
+                conn.sendall(b'{"ok": true, "echo": ' + json.dumps(data.decode().rstrip("\n")).encode() + b"}\n")
+                srv.close()
+
+        import threading
+        t = threading.Thread(target=echo, daemon=True)
+        t.start()
+        resp = send_command("ping", sock)
+        assert resp["ok"] and resp["echo"] == "ping"
+        t.join(timeout=2)
+    print("  OK    send_command round-trip + JSON parsing")
+
+    try:
+        send_command("status", "/nonexistent/socket.sock")
+        raise AssertionError("expected failure for missing socket")
+    except (FileNotFoundError, ConnectionRefusedError):
+        pass
+    print("  OK    send_command raises cleanly when daemon is down")
+
+
 def test_default_socket_path():
     print("\n[Test] default_socket_path resolution")
     old = {k: os.environ.get(k) for k in ("AMBIENT_SOCKET", "XDG_RUNTIME_DIR")}
@@ -454,5 +570,9 @@ if __name__ == "__main__":
     test_writer_heartbeat()
     test_writer_suspend_releases_and_resumes_link()
     test_control_socket()
+    test_control_socket_algo()
+    test_reactivity_mapping()
+    test_control_socket_reactivity()
+    test_send_command()
     test_default_socket_path()
     print("\n✅ All ambient tests passed.\n")

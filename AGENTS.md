@@ -11,10 +11,16 @@ here has been verified on this specific unit.
 
 ## Project direction / active plan
 
-Next milestone is an **ambient hue-sync daemon**: sample a low-res capture of
-the display, compute the predominant hue, and drive the strip in real time
-(smooth, toggleable, auto-starting). Design, algorithm options, build order and
-acceptance criteria are in **`PLAN.md`** — read it before working on this.
+The ambient hue-sync daemon is **built, installed and verified**: low-res
+capture → predominant hue → smooth strip drive, toggleable, auto-starting
+(`ambient.service`), controllable live over a Unix socket (`ambientctl`,
+`ambienttray`). Design, algorithm options, build order and acceptance criteria
+are in **`PLAN.md`** — read it before working on this.
+
+Current focus: **Step 4 live tuning** across a range of wallpapers (defaults are
+already tuned in code) and the **Step 6 tail** (journald structured-logging
+review). The tray is **shipped as a user service** (`ambient-tray.service`,
+installed + enabled 2026-09-18).
 
 Standing instruction for every future session: whenever you make progress in
 this endeavour (new files, decisions, findings, gotchas, test results), update
@@ -64,15 +70,42 @@ Build order from PLAN.md — checked items are done and verified on this host:
       retry, 2026-09-18) and logs go to journald via stderr; the reconnect
       backoff + heartbeat hardening landed in Step 3/5. Remaining: journald
       structured logging review, if any.
+- [x] **Tray milestone (2026-09-18)** — `ambienttray` taskbar icon + live
+      algorithm switching + reaction-speed slider: added the `algo NAME` and
+      `reactivity 0-100` socket commands (validated; `status` now lists `algos`
+      and reports `reactivity`/`alpha`/`max_step`), producer resolves
+      `ALGORITHMS[name]` per-frame so switches apply on the next frame; shared
+      `send_command` moved into `ledctl_lib.py` (ambientctl + tray both use it);
+      `ambientctl algo NAME` + `ambientctl reactivity N` added. **Verified live
+      under systemd (2026-09-18):** on the real strip `ambientctl algo
+      histogram|kmeans|circular` and `ambientctl reactivity N` round-trip
+      (status echoes them), invalid values rejected, `off`/`on` still
+      release+reconnect, and `ambienttray` runs against the live socket
+      (offscreen smoke + live connected). Tray UX details: click-toggle uses
+      `QAction.triggered` (not `toggled`) so the 1 s status poll's `setChecked`
+      never fires a stray socket write, and every action is followed by a full
+      status refresh (on/off/algo/reactivity replies are partial). **The
+      reaction-speed slider lives in a small popup window, NOT the menu**:
+      Plasma renders the menu over DBusMenu, which cannot host arbitrary
+      widgets. Offline suite now `test_ambient.py` (19) including
+      `test_control_socket_algo`, `test_reactivity_mapping`,
+      `test_control_socket_reactivity`, `test_send_command`, plus `test_tray.py`
+      (4) covering the speed-panel sync/debounce/mid-drag logic over an
+      offscreen Qt. **Shipped as a user service (2026-09-18):**
+      `ambient-tray.service` installed + enabled and running — see the
+      `ambienttray` section below.
 
 Current milestone: Step 4 tuning (needs live tuning on a range of wallpapers);
 Step 5 (install/enable + live socket control under systemd) is done and fully
-verified on this host (2026-09-18).
+verified on this host (2026-09-18); tray milestone complete + verified live
+against the real strip and **shipped as `ambient-tray.service`** (installed +
+enabled, 2026-09-18).
 
 Full pipeline is: `capture.py` → `coloralg.py` → smoother (circular EMA in
-`ambient.py`) → `ledctl_lib.Strip` (reconnectable BLE writer). All four scripts
-plus `test_coloralg.py`/`test_ambient.py` pass on this host. The daemon is
-installed + enabled as `ambient.service` and running.
+`ambient.py`) → `ledctl_lib.Strip` (reconnectable BLE writer). The offline
+suites `test_coloralg.py` (4), `test_ambient.py` (19) and `test_tray.py` (4)
+pass on this host. The daemon is installed + enabled as `ambient.service` and
+running; the tray (`ambienttray`) is run manually for now.
 
 Docs live in **`README.md`** (overview) + **`docs/`** (`protocol.md`,
 `usage.md`, `troubleshooting.md`). Keep them in sync when the CLI/flags,
@@ -207,10 +240,14 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
   always writes the latest hue (drops stale, no queueing). Grey/black frames
   hold the last colour (no strobe).
 - **ctl** Unix-socket control server (path = `ledctl_lib.default_socket_path()`).
-  Line protocol, JSON replies: `status` (paused/connected/address/hue/uptime),
-  `on`/`off` (pause = idle capture + release BLE link, strip holds last colour;
-  resume = reconnect + FRAME_ON + re-sync), `stop` (full shutdown → applies
-  `--stop-state`). Stale socket unlinked on start and on exit.
+  Line protocol, JSON replies: `status` (paused/connected/address/hue/uptime +
+  `algo`, the `algos` list, `reactivity`, `alpha`, `max_step`), `on`/`off`
+  (pause = idle capture + release BLE link, strip holds last colour; resume =
+  reconnect + FRAME_ON + re-sync), `algo NAME` (switch colour algorithm live —
+  the producer resolves `ALGORITHMS[name]` per-frame), `reactivity 0-100` (one
+  knob that sets BOTH `alpha` and `max_step`; see the mapping below), `stop`
+  (full shutdown → applies `--stop-state`). Stale socket unlinked on start and
+  on exit.
 - **Heartbeat (replaces the earlier ATT probe; 2026-09-18).** Symptom seen
   live: the strip was changing colour on its *own* (running its built-in
   colour-cycle effect) and ignoring every screen change, while BlueZ still
@@ -227,9 +264,16 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
   `heartbeat failed (ConnectionError): strip link is down` → `connected to …`
   → colour re-synced, all in ~1 s. The strip cannot stall in its own effect
   mode because colour frames arrive every heartbeat or on reconnect.
+- **Reaction-speed mapping (2026-09-18).** `--reactivity R` (0–100) is a single
+  knob exposed by the tray slider; `reactivity_to_params(R)` maps it linearly to
+  BOTH the tracking EMA and the per-write sweep:
+  `alpha = 0.05 + 0.70·R/100` (0.05…0.75), `max_step = 1 + 14·R/100` (1…15°).
+  `R=50` reproduces the tuned defaults (alpha 0.4, max_step 8.0°) exactly.
+  `params_to_reactivity()` inverts it from `max_step` (a `max_step` of 0 means
+  the limit is disabled, treated as fastest → 100).
 - Flags: `--algo --brightness --width/--height --tick --alpha --min-delta
-  --max-step --change-threshold --heartbeat --timeout --retry --stop-state
-  off|last --no-write --socket`.
+  --max-step --reactivity --change-threshold --heartbeat --timeout --retry
+  --stop-state off|last --no-write --socket`.
 - **Portal-Start hardening (2026-09-18).** The KWin consent handshake (portal
   `Start`) is a blocking call that can sit unanswered indefinitely. It now runs
   on a **daemon thread with a cancellable poll**, not the asyncio default
@@ -244,26 +288,34 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
   strip off, `last` leaves it on the current colour.
 - `test_ambient.py` covers EMA wrap, arc, frame-delta, hue→rgb, producer
   tracking/hold, writer power-on + delta gate + heartbeat, suspend/release/
-  resume, the control socket (real unix socket, status/on/off/unknown) and
-  `default_socket_path` resolution (fake capture/strip, no hardware).
+  resume, the control socket (real unix socket, status/on/off/algo/reactivity/
+  unknown, `send_command` round-trip + failure), the reactivity↔params mapping,
+  and `default_socket_path` resolution (fake capture/strip, no hardware).
 
 ### `ambientctl` — control + systemd install CLI (Step 5)
 
 ```bash
 ./ambientctl status              # paused?/connected?/hue/uptime  (over the socket)
 ./ambientctl on | off | stop     # resume / pause / full shutdown
+./ambientctl algo histogram      # switch colour algorithm live
+./ambientctl reactivity 70       # reaction-speed slider: sets alpha + max-step
 ./ambientctl install [--mac ADDR]  # writes ~/.config/systemd/user/ambient.service
 ./ambientctl enable | disable      # systemctl --user enable|disable --now
 ./ambientctl uninstall
 ```
 
-- `status`/`on`/`off`/`stop` talk to the daemon's Unix socket — no restart.
-  `off` = pause: sensing stops AND the BLE link is released (single-connection
-  controller is free for a phone app while paused); the strip holds its last
-  colour. `on` = resume: reconnect + re-sync.
+- `status`/`on`/`off`/`stop`/`algo NAME`/`reactivity N` talk to the daemon's
+  Unix socket — no restart. `off` = pause: sensing stops AND the BLE link is
+  released (single-connection controller is free for a phone app while paused);
+  the strip holds its last colour. `on` = resume: reconnect + re-sync. `algo`
+  validates the name (errors list the available algorithms) and the producer
+  picks it up on the next frame. `reactivity` (0–100) sets both the tracking EMA
+  and the per-write transition sweep.
 - Socket path: `--socket` flag, else `AMBIENT_SOCKET` env, else
   `ledctl_lib.default_socket_path()`. Importable module + standalone script
-  (no `.py` suffix; loads via `importlib` when reused in tests).
+  (no `.py` suffix; loads via `importlib` when reused in tests). The socket
+  client (`send_command`, JSON reply, socket timeout) lives in `ledctl_lib.py`
+  and is shared with `ambienttray`.
 - `install` bakes the resolved script path + socket path into the unit;
   `--mac` bakes a fixed strip address (omit → auto-scan). **Deliberate
   deviation from PLAN's `Restart=always`: the unit uses `Restart=on-failure`
@@ -271,6 +323,51 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
   stopped, while crashes / missing-device shortages still restart.**
   `After=graphical-session.target` + `PartOf=`, `WantedBy=default.target` —
   lifetime tied to the graphical session, no root needed.
+
+### `ambienttray` — taskbar tray icon (PySide6), live toggle + algo picker
+
+```bash
+./ambienttray                       # run the tray in the foreground
+./ambienttray --socket /tmp/a.sock  # override control-socket path
+./ambienttray install               # writes ~/.config/systemd/user/ambient-tray.service
+./ambienttray enable | disable      # systemctl --user enable|disable --now
+./ambienttray uninstall
+```
+
+- PySide6 (native StatusNotifier on Plasma; 6.11 moved `QAction` to `QtGui`).
+  Shows the strip's current hue as a coloured status dot (hue → QColor), polls
+  the daemon every 1 s, degrades gracefully offline.
+- **Left-click** toggles sync on/off (same as `ambientctl on|off` — releases
+  the BLE link while paused, so a phone app can use the strip). Right-click
+  menu: status line, Pause/Resume checkable toggle, **Colour algorithm** radio
+  submenu (from `coloralg.ALGORITHMS`, sends `algo NAME` over the socket),
+  **Reaction speed …** (opens the slider popup), Start/Stop daemon
+  (`systemctl --user start ambient` / `stop` command), Quit.
+- **Reaction-speed slider** (`reactivity 0-100`, one axis: smooth/slow ↔
+  quick/responsive). It lives in a small frameless `Qt.Tool` popup opened from
+  the menu — **not embedded in the QMenu**, because Plasma renders the tray menu
+  over DBusMenu which can't host arbitrary widgets. `_build_speed_panel()` in
+  `ambienttray` builds it (Qt imported lazily so the module still imports
+  headless for `install`); it debounces 120 ms, blocks echo writes while
+  dragging, and `sync(level, alpha, max_step)` reflects daemon state.
+- Icon states: hue colour = running+linked; amber = running, no strip link;
+  green = linked, no hue yet; grey = paused or daemon unreachable.
+- The tray is deliberately independent of the daemon (it's a socket client, not
+  a part of the pipeline). It installs its own `ambient-tray.service`
+  (`After=graphical-session.target`, `PartOf=`, `Restart=on-failure`) with the
+  script + socket path baked in, and survives Ctrl-C cleanly. **Installed +
+  enabled on this host 2026-09-18** (`ambienttray install && ambienttray
+  enable`); the GUI env (`WAYLAND_DISPLAY`/`DISPLAY`) is imported into
+  `systemd --user` here so the service starts fine. Startup order: the icon is
+  painted (first `status`, then `setIcon`) *before* `setVisible(True)` to avoid
+  Qt's "No Icon set" warning; the click-toggle calls `refresh()` (full status)
+  rather than trusting the partial `on`/`off` reply, otherwise the icon
+  flickers to "no strip" until the next poll.
+- Shares `ledctl_lib.send_command` / `default_socket_path` with `ambientctl`.
+  No `.py` suffix (loaded via importlib when reused in tests). `test_tray.py`
+  (4) exercises `send_or_none` plus the speed-panel over an offscreen
+  `QApplication` (sync/commit-debounce/mid-drag-ignore); it skips the Qt tests
+  cleanly if PySide6 is missing.
 
 ### `test_device.py` — raw frame tester
 
@@ -324,6 +421,17 @@ print(c.read_frame_pixels()[:3]); c.close()"
   advertising, and also when powered off. `BleakClient(address)` then fails with
   "Device not found". Scan (or wait) for it to reappear; occasionally needs a
   physical power-cycle. Waiting ~20s for a fresh advertisement usually works.
+- **Restarting the daemon can leave the link down (2026-09-18, looks like a bug
+  but isn't).** `systemctl --user restart ambient` runs the old instance's
+  shutdown, which with `--stop-state off` powers the strip *off*. A powered-off
+  strip stops advertising, so the freshly-started daemon's connect loop spins on
+  `BleakDeviceNotFoundError` ("link down … retrying") until the strip
+  re-advertises. Because the new instance's scanner starts cold, this can take
+  longer than a normal sleep-reconnect; a **manual `bluetoothctl scan` or a
+  second `systemctl --user start` once it is advertising** connects immediately
+  (observed: restart-while-off → link down for >90 s; once the strip showed up
+  in `bluetoothctl`, a restart linked in <5 s and logged `connected to …` +
+  `hue= … → rgb=(…)`). Not a regression — the device really is off.
 - **Scan-vs-connect BlueZ conflict.** BlueZ refuses a `Connect` while any
   discovery session is active (`org.bluez.Error.InProgress`); passive scans are
   also rejected here unless you pass `or_patterns`. `ledctl_lib.Strip` handles
