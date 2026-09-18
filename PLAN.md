@@ -173,7 +173,9 @@ defaults sane so the daemon runs with zero config.
    — **DONE:** `ambienttray` (PySide6, native Plasma StatusNotifier): left-click
    toggles sync on/off, menu has a Pause/Resume toggle, a colour-algorithm
    radio list, and a "Reaction speed …" popup with a 0–100 slider, plus a
-   hue-coloured status dot. Daemon gained the `algo NAME` + `reactivity 0-100`
+   minimal white line-art light-bulb icon whose glass fills with the current hue
+   (`render_icon`, ~20% accent area, native sizes 16–64 px). Daemon gained the
+   `algo NAME` + `reactivity 0-100`
    socket commands (validated; `status` now returns `algo`, the `algos` list,
    `reactivity`, `alpha`, `max_step`) and the producer re-resolves
    `ALGORITHMS[name]` per frame so switches apply on the next frame. The single
@@ -184,13 +186,28 @@ defaults sane so the daemon runs with zero config.
    **Live-verified under systemd (2026-09-18):** algo + reactivity switches
    round-trip on the real strip (status echoes them), invalid values rejected,
    off/on still release+reconnect, tray runs against the live socket (offscreen
-   smoke + connected). Offline suite grew to 19 ambient tests incl.
+   smoke + connected). Offline suite grew to 23 ambient tests incl.
    `test_control_socket_algo`, `test_reactivity_mapping`,
    `test_control_socket_reactivity`, `test_send_command`, plus `test_tray.py`
-   (4) for the speed panel. **Shipped as a user service 2026-09-18**
+   (5) for the icon + speed panel. **Shipped as a user service 2026-09-18**
    (`ambient-tray.service` installed + enabled). **Gotcha:** the slider is a
    separate popup, not embedded in the menu — Plasma draws the tray menu over
    DBusMenu, which can't host arbitrary widgets.
+8. ✅ Persist live `algo` + `reactivity` across daemon restarts (extra-milestone,
+   2026-09-18).
+   — **DONE:** `ambient.py` writes the live choices atomically to
+   `state_path()` (`$XDG_STATE_HOME|~/.local/state` + `/ambient/state.json`) on
+   every `algo`/`reactivity` socket command, and resolves startup control with
+   precedence **explicit CLI flags > saved state > tuned defaults**. `--algo` /
+   `--alpha` / `--max-step` default to `None` (a custom `_Formatter` hides the
+   `None`) so "unset" is distinguishable from "explicitly set to the default".
+   New tests: `test_saved_control_roundtrip`,
+   `test_ambient_restart_restores_saved_state`,
+   `test_ambient_explicit_flags_override_saved`, `test_control_socket_persists`
+   (suite isolates `XDG_STATE_HOME` to a temp dir). **Live-verified
+   (2026-09-18):** `algo kmeans` + `reactivity 70` wrote
+   `{"algo": "kmeans", "reactivity": 70.0}`; a `systemctl --user restart` came
+   back at kmeans / R70; setting `circular` / `50` restored the defaults.
 
 ## Performance / negligible-tax strategy
 

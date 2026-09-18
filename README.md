@@ -88,7 +88,10 @@ Every script's full usage is in [docs/usage.md](docs/usage.md).
   producer re-resolves it per frame). `reactivity 0-100` sets one
   smooth↔quick axis that drives both the tracking EMA and the per-write
   transition sweep. `stop` shuts the daemon down into the `--stop-state`
-  behaviour.
+  behaviour. The live `algo` + `reactivity` choices are **persisted** to
+  `~/.local/state/ambient/state.json`, so a restart (crash, upgrade, or
+  `systemctl --user restart`) resumes them instead of snapping back to the
+  tuned defaults.
 
 Neutral/gray/black frames hold the last colour — a plain desktop never strobes.
 See [docs/protocol.md](docs/protocol.md) for the wire protocol and
@@ -106,6 +109,9 @@ For live tuning there's a single **reaction-speed** knob: `--reactivity 0-100`
 (or `ambientctl reactivity N`, or the tray's slider). It sets *both* `--alpha`
 and `--max-step` on one axis — left is smooth/slow, right is quick/responsive —
 with `50` reproducing the tuned defaults (α 0.4, 8°/write). No restart needed.
+Both `algo` and `reactivity` survive daemon restarts (see above); an explicit
+CLI flag (`--algo`, `--reactivity`, `--alpha`/`--max-step`) always wins over the
+saved choice.
 
 Choose a different hue algorithm with `--algo` (or `ambientctl algo NAME`, or
 the tray's radio menu):

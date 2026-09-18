@@ -119,6 +119,10 @@ def hue_to_rgb(hue_deg: float, brightness: float) -> tuple[int, int, int]:
 # (max_step) so "smooth vs quick" is one axis.
 REACTIVITY_ALPHA_RANGE = (0.05, 0.75)
 REACTIVITY_MAX_STEP_RANGE = (1.0, 15.0)
+# the tuned defaults (== reactivity 50); used when neither the CLI nor the
+# persisted state pins a reaction speed
+DEFAULT_ALPHA = 0.4
+DEFAULT_MAX_STEP = 8.0
 
 
 def reactivity_to_params(r: float) -> tuple[float, float]:
@@ -143,6 +147,35 @@ def params_to_reactivity(alpha: float, max_step: float) -> float:
     return round(min(100.0, max(0.0, r)), 1)
 
 
+# The live control choices (algorithm + reaction speed, set via the tray or
+# `ambientctl`) are persisted so a daemon restart — crash, upgrade, or an
+# explicit `systemctl --user restart` — resumes the last user choice instead of
+# snapping back to the tuned defaults. Same state dir as the portal token.
+def state_path() -> str:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "ambient", "state.json")
+
+
+def load_saved_control() -> dict:
+    """Return the persisted {algo, reactivity}, or {} if absent/corrupt."""
+    try:
+        with open(state_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_control_state(algo: str, reactivity: float) -> None:
+    """Atomically persist the live control choices."""
+    path = state_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"algo": algo, "reactivity": round(float(reactivity), 1)}, f)
+    os.replace(tmp, path)
+
+
 class _UserStop(Exception):
     """Ask the writer task to finish because the user requested shutdown."""
 
@@ -152,16 +185,36 @@ class _UserStop(Exception):
 # ---------------------------------------------------------------------------
 
 class Ambient:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        # `--reactivity` is the single reaction-speed knob; when supplied it
-        # derives alpha + max_step. Otherwise seed it from the tuned flags so
-        # `status` always reports a consistent slider position.
-        if getattr(cfg, "reactivity", None) is not None:
+    @staticmethod
+    def _resolve_control(cfg) -> None:
+        """Pin `algo` + reaction speed, in order of precedence:
+
+        1. explicit CLI flags (`--reactivity`, `--alpha`/`--max-step`, `--algo`)
+        2. the persisted live-control state (last tray/`ambientctl` choice)
+        3. the tuned defaults (reactivity 50 == alpha 0.4, max_step 8.0)
+        """
+        saved = load_saved_control()
+        if cfg.algo is None:
+            saved_algo = saved.get("algo")
+            cfg.algo = saved_algo if saved_algo in ALGORITHMS else DEFAULT_ALGO
+        if cfg.reactivity is not None:
             cfg.reactivity = round(float(cfg.reactivity), 1)
             cfg.alpha, cfg.max_step = reactivity_to_params(cfg.reactivity)
-        else:
+        elif cfg.alpha is not None or cfg.max_step is not None:
+            cfg.alpha = DEFAULT_ALPHA if cfg.alpha is None else float(cfg.alpha)
+            cfg.max_step = (DEFAULT_MAX_STEP if cfg.max_step is None
+                            else float(cfg.max_step))
             cfg.reactivity = params_to_reactivity(cfg.alpha, cfg.max_step)
+        elif saved.get("reactivity") is not None:
+            cfg.reactivity = round(float(saved["reactivity"]), 1)
+            cfg.alpha, cfg.max_step = reactivity_to_params(cfg.reactivity)
+        else:
+            cfg.alpha, cfg.max_step = DEFAULT_ALPHA, DEFAULT_MAX_STEP
+            cfg.reactivity = params_to_reactivity(cfg.alpha, cfg.max_step)
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._resolve_control(cfg)
         self.strip = Strip(cfg.mac)
         self._start = time.monotonic()
         self._stop = asyncio.Event()
@@ -466,6 +519,7 @@ class Ambient:
             if words[1] != self.cfg.algo:   # avoid noisy log spam on repeat
                 print(f"[ctl] algo -> {words[1]}", file=sys.stderr)
             self.cfg.algo = words[1]
+            save_control_state(self.cfg.algo, self.cfg.reactivity)
             return {"ok": True, "algo": self.cfg.algo}
         if cmd == "reactivity":
             if len(words) < 2:
@@ -481,6 +535,7 @@ class Ambient:
             print(f"[ctl] reactivity -> {self.cfg.reactivity} "
                   f"(alpha={self.cfg.alpha} max_step={self.cfg.max_step})",
                   file=sys.stderr)
+            save_control_state(self.cfg.algo, self.cfg.reactivity)
             return {"ok": True, "reactivity": self.cfg.reactivity,
                     "alpha": self.cfg.alpha, "max_step": self.cfg.max_step}
         if cmd == "stop":
@@ -493,13 +548,13 @@ class Ambient:
         while not self._stop.is_set():
             try:
                 line = await reader.readline()
+                if not line:
+                    break
+                resp = self._handle_command(line.decode("utf-8", "replace"))
+                writer.write((json.dumps(resp) + "\n").encode())
+                await writer.drain()
             except (ConnectionError, OSError):
-                break
-            if not line:
-                break
-            resp = self._handle_command(line.decode("utf-8", "replace"))
-            writer.write((json.dumps(resp) + "\n").encode())
-            await writer.drain()
+                break   # client gave up / disconnected mid-reply
         writer.close()
         try:
             await writer.wait_closed()
@@ -539,23 +594,33 @@ class Ambient:
 # ---------------------------------------------------------------------------
 
 def parse_args(argv=None) -> argparse.Namespace:
+    class _Formatter(argparse.ArgumentDefaultsHelpFormatter):
+        # hide "(default: None)" for flags whose real default is resolved at
+        # runtime (algo + reaction speed come from the persisted state)
+        def _get_help_string(self, action):
+            if action.default is None:
+                return action.help
+            return super()._get_help_string(action)
+
     p = argparse.ArgumentParser(
         description="Ambient display-to-LED hue sync (foreground prototype).",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+        formatter_class=_Formatter)
     p.add_argument("--mac", help="strip BLE address (default: auto-scan by name)")
-    p.add_argument("--algo", choices=sorted(ALGORITHMS), default=DEFAULT_ALGO,
-                   help="colour algorithm")
+    p.add_argument("--algo", choices=sorted(ALGORITHMS), default=None,
+                   help="colour algorithm "
+                        "(default: circular, or the last live choice)")
     p.add_argument("--brightness", type=int, default=100, help="LED brightness 0-100")
     p.add_argument("--width", type=int, default=48, help="capture width px")
     p.add_argument("--height", type=int, default=27, help="capture height px")
     p.add_argument("--tick", type=float, default=0.2, help="capture/smooth tick (s)")
-    p.add_argument("--alpha", type=float, default=0.4, help="hue EMA factor (0-1)")
+    p.add_argument("--alpha", type=float, default=None,
+                   help="hue EMA factor (0-1); default 0.4")
     p.add_argument("--min-delta", type=float, default=0.5,
                    help="min hue arc (deg) to trigger a BLE write")
-    p.add_argument("--max-step", type=float, default=8.0,
+    p.add_argument("--max-step", type=float, default=None,
                    help="max hue change (deg) per BLE write; bounds transition "
                         "speed so colour changes glide rather than jump "
-                        "(0 disables the step limit)")
+                        "(0 disables the step limit); default 8.0")
     p.add_argument("--reactivity", type=float, default=None,
                    help="reaction-speed slider 0-100: sets BOTH --alpha and "
                         "--max-step (0=smooth/slow, 50=tuned defaults, "

@@ -21,6 +21,9 @@ from ambient import (
 )
 from ledctl_lib import FRAME_ON, color_frame, default_socket_path, send_command
 
+# isolate the persisted live-control state (and the portal token) from the host
+os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="ambient-test-state-")
+
 
 # ---------------------------------------------------------------------------
 # pure helpers
@@ -384,6 +387,13 @@ def _sock_cmd(path: str, cmd: str) -> dict:
     return json.loads(buf)
 
 
+def _clear_state() -> None:
+    try:
+        os.remove(ambient.state_path())
+    except FileNotFoundError:
+        pass
+
+
 def test_control_socket():
     print("\n[Test] control socket: status/on/off/stop over a real unix socket")
     with tempfile.TemporaryDirectory() as tmp:
@@ -419,6 +429,7 @@ def test_control_socket():
 
 def test_control_socket_algo():
     print("\n[Test] control socket: algo switch live over the socket")
+    _clear_state()
     with tempfile.TemporaryDirectory() as tmp:
         cfg = parse_args(["--no-write", "--mac", "AA:BB:CC:DD:EE:FF"])
         a = Ambient(cfg)
@@ -471,6 +482,7 @@ def test_reactivity_mapping():
 
 def test_control_socket_reactivity():
     print("\n[Test] control socket: reactivity slider live over the socket")
+    _clear_state()
     with tempfile.TemporaryDirectory() as tmp:
         cfg = parse_args(["--no-write", "--mac", "AA:BB:CC:DD:EE:FF"])
         a = Ambient(cfg)
@@ -500,6 +512,78 @@ def test_control_socket_reactivity():
 
         asyncio.run(go())
     print("  OK    status reports R/alpha/max-step; set + validation round-trip")
+
+
+def test_saved_control_roundtrip():
+    print("\n[Test] live control persists to state.json (atomic round-trip)")
+    _clear_state()
+    try:
+        assert ambient.load_saved_control() == {}
+        ambient.save_control_state("kmeans", 73.0)
+        assert ambient.load_saved_control() == {"algo": "kmeans", "reactivity": 73.0}
+        with open(ambient.state_path(), "w", encoding="utf-8") as f:
+            f.write("{not json")
+        assert ambient.load_saved_control() == {}   # corrupt -> ignored
+    finally:
+        _clear_state()
+    print("  OK    save/load round-trip; absent + corrupt state -> {}")
+
+
+def test_ambient_restart_restores_saved_state():
+    print("\n[Test] daemon restart restores the saved algo + reactivity")
+    _clear_state()
+    ambient.save_control_state("histogram", 80.0)
+    try:
+        a = Ambient(parse_args(["--no-write", "--mac", "AA:BB:CC:DD:EE:FF"]))
+        assert a.cfg.algo == "histogram", a.cfg.algo
+        assert a.cfg.reactivity == 80.0, a.cfg.reactivity
+        assert (a.cfg.alpha, a.cfg.max_step) == (0.61, 12.2)
+    finally:
+        _clear_state()
+    print("  OK    fresh Ambient picks up histogram / R80 instead of defaults")
+
+
+def test_ambient_explicit_flags_override_saved():
+    print("\n[Test] explicit CLI flags beat the saved live-control state")
+    from ambient import params_to_reactivity
+    _clear_state()
+    ambient.save_control_state("histogram", 80.0)
+    try:
+        a = Ambient(parse_args(["--no-write", "--algo", "kmeans",
+                                "--reactivity", "20"]))
+        assert a.cfg.algo == "kmeans" and a.cfg.reactivity == 20.0
+        # --alpha wins over the saved slider, but the unset --algo still loads
+        a2 = Ambient(parse_args(["--no-write", "--alpha", "0.65"]))
+        assert a2.cfg.alpha == 0.65
+        assert a2.cfg.reactivity == params_to_reactivity(0.65, 8.0)
+        assert a2.cfg.algo == "histogram"
+    finally:
+        _clear_state()
+    print("  OK    --algo/--reactivity/--alpha win; only unset fields fall back")
+
+
+def test_control_socket_persists():
+    print("\n[Test] socket algo/reactivity changes are persisted")
+    _clear_state()
+    with tempfile.TemporaryDirectory() as tmp:
+        a = Ambient(parse_args(["--no-write", "--mac", "AA:BB:CC:DD:EE:FF"]))
+        a.socket_path = os.path.join(tmp, "ambient-test.sock")
+
+        async def go():
+            task = asyncio.create_task(a._ctl_server())
+            await asyncio.sleep(0.15)
+            try:
+                await asyncio.to_thread(_sock_cmd, a.socket_path, "algo kmeans")
+                await asyncio.to_thread(_sock_cmd, a.socket_path, "reactivity 70")
+            finally:
+                a.stop()
+                await task
+
+        asyncio.run(go())
+    saved = ambient.load_saved_control()
+    _clear_state()
+    assert saved == {"algo": "kmeans", "reactivity": 70.0}, saved
+    print("  OK    state.json reflects the live algo + slider")
 
 
 def test_send_command():
@@ -573,6 +657,10 @@ if __name__ == "__main__":
     test_control_socket_algo()
     test_reactivity_mapping()
     test_control_socket_reactivity()
+    test_saved_control_roundtrip()
+    test_ambient_restart_restores_saved_state()
+    test_ambient_explicit_flags_override_saved()
+    test_control_socket_persists()
     test_send_command()
     test_default_socket_path()
     print("\n✅ All ambient tests passed.\n")

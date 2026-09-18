@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Taskbar tray icon for the ambient hue-sync daemon (KDE Plasma / PySide6).
 
-Shows the current strip hue as a coloured dot, lets you pause/resume the
-sync with one click, and switch the colour algorithm from a menu — all live
-over the daemon's Unix control socket (ledctl_lib.default_socket_path).
+Shows the strip's current hue as the glowing core of a minimal white line-art
+light-bulb icon, lets you pause/resume the sync with one click, and switch the
+colour algorithm from a menu — all live over the daemon's Unix control socket
+(ledctl_lib.default_socket_path).
 
     ambienttray                # run the tray (in the foreground)
     ambienttray --socket P     # override control-socket path
@@ -30,6 +31,65 @@ from ledctl_lib import default_socket_path, send_command
 _SERVICE_FILENAME = "ambient-tray.service"
 # how often to refresh from the daemon socket, seconds
 _POLL_INTERVAL_MS = 1000
+# tray icons are requested at several sizes; render each natively so the 1px
+# line-art stays crisp instead of being a scaled-down 64px bitmap
+_ICON_SIZES = (16, 22, 24, 32, 48, 64)
+_ICON_GRID = 24.0
+_ICON_STROKE = (0xF2, 0xF2, 0xF2)   # near-white line art
+
+
+def render_icon(accent, stroke=None):
+    """Minimal white line-art tray icon: a light-bulb outline whose glass is
+    filled with `accent` (an (r, g, b) tuple) over ~20% of the icon area.
+
+    Returns a multi-size QIcon. Qt is imported lazily so this module still
+    imports headless (for `install`).
+    """
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+
+    stroke_col = QColor(*(stroke or _ICON_STROKE))
+    accent_col = QColor(*accent)
+
+    # geometry on the 24x24 grid; the filled glass is r = stroke-inner radius,
+    # which makes the accent cover ~20% of the icon's area (pi*6.05^2/24^2)
+    cx, cy, glass_r, stroke_w = 12.0, 9.4, 7.0, 1.9
+    fill_r = glass_r - stroke_w / 2.0
+
+    def paint(p) -> None:
+        pen = QPen(stroke_col)
+        pen.setWidthF(stroke_w)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+
+        # glass: accent fill framed by the white outline
+        p.setPen(Qt.NoPen)
+        p.setBrush(accent_col)
+        p.drawEllipse(QPointF(cx, cy), fill_r, fill_r)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(QPointF(cx, cy), glass_r, glass_r)
+
+        # neck -> collar -> screw base
+        p.drawLine(QPointF(9.3, 15.9), QPointF(9.3, 17.6))
+        p.drawLine(QPointF(14.7, 15.9), QPointF(14.7, 17.6))
+        p.drawLine(QPointF(9.3, 17.6), QPointF(14.7, 17.6))
+        p.drawLine(QPointF(10.3, 17.6), QPointF(10.3, 20.3))
+        p.drawLine(QPointF(13.7, 17.6), QPointF(13.7, 20.3))
+        p.drawLine(QPointF(10.3, 20.3), QPointF(13.7, 20.3))
+
+    icon = QIcon()
+    for size in _ICON_SIZES:
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.scale(size / _ICON_GRID, size / _ICON_GRID)
+        paint(p)
+        p.end()
+        icon.addPixmap(pm)
+    return icon
+
 
 
 def send_or_none(cmd: str, socket_path: str) -> dict | None:
@@ -202,7 +262,7 @@ def _do_uninstall() -> int:
 def _run_tray(socket_path: str) -> int:
     """Build and run the PySide6 tray icon (blocks until the tray closes)."""
     from PySide6.QtCore import Qt, QTimer
-    from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
+    from PySide6.QtGui import QAction, QColor, QIcon
     from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
     from coloralg import ALGORITHMS
@@ -261,15 +321,7 @@ def _run_tray(socket_path: str) -> int:
         return QColor.fromHsvF(h, 0.95, 0.95)
 
     def make_icon(colour: QColor) -> QIcon:
-        pm = QPixmap(16, 16)
-        pm.fill(Qt.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.Antialiasing)
-        p.setBrush(colour)
-        p.setPen(Qt.NoPen)
-        p.drawEllipse(2, 2, 12, 12)
-        p.end()
-        return QIcon(pm)
+        return render_icon(colour.getRgb()[:3])
 
     # --- state + refresh ----------------------------------------------------
     state: dict = {"online": False, "running": False, "linked": False,

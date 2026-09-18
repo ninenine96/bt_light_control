@@ -50,7 +50,7 @@ python3 ambient.py --no-write                               # capture→colour o
 | Flag | Default | Meaning |
 |---|---|---|
 | `--mac ADDR` | auto-scan | strip BLE address |
-| `--algo NAME` | `circular` | `circular`, `histogram`, `kmeans`, `average` |
+| `--algo NAME` | `circular` | `circular`, `histogram`, `kmeans`, `average`; an explicit flag overrides the persisted live choice |
 | `--brightness N` | 100 | LED brightness 0–100 |
 | `--width/--height N` | 48 / 27 | capture resolution (px) |
 | `--tick S` | 0.2 | capture/smoothing tick (s) |
@@ -94,6 +94,13 @@ python3 ambientctl uninstall             # remove the unit
   `algos` list) and `reactivity`/`alpha`/`max_step`. `reactivity` (0–100) is a
   single smooth↔quick axis that sets both the tracking EMA and the per-write
   transition sweep (`50` = the tuned defaults).
+- **Live control persists across restarts.** `algo NAME` and `reactivity N`
+  write the choice to `~/.local/state/ambient/state.json` (atomically). When the
+  daemon starts it prefers, in order: explicit CLI flags → the saved state →
+  the tuned defaults. So a crash, an upgrade, or `systemctl --user restart`
+  resumes your last algorithm + reaction speed, while an explicit `--algo` /
+  `--reactivity` (or `--alpha`/`--max-step`) on the command line still wins. A
+  missing or corrupt state file silently falls back to the defaults.
 - The socket lives at `$AMBIENT_SOCKET`, else `$XDG_RUNTIME_DIR/ambient.sock`
   (falls back to `~/.local/state/ambient/ambient.sock`). Point the CLI
   elsewhere with `--socket PATH` / the `AMBIENT_SOCKET` env var.
@@ -178,8 +185,9 @@ No hardware needed:
 ```bash
 python3 test_coloralg.py     # all 4 algorithms on solid/noisy/gray/band inputs
 python3 test_ambient.py      # EMA arc/delta, producer/writer, socket
-                             # (status/algo/reactivity), reactivity mapping
-python3 test_tray.py         # send_or_none + tray speed-panel (offscreen Qt)
+                             # (status/algo/reactivity), reactivity mapping,
+                             # state.json persistence + restart precedence
+python3 test_tray.py         # icon render + send_or_none + speed-panel (offscreen Qt)
 ```
 
 Both exit non-zero on failure and print `✅ All … passed` on success.

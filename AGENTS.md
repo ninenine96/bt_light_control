@@ -87,13 +87,31 @@ Build order from PLAN.md — checked items are done and verified on this host:
       status refresh (on/off/algo/reactivity replies are partial). **The
       reaction-speed slider lives in a small popup window, NOT the menu**:
       Plasma renders the menu over DBusMenu, which cannot host arbitrary
-      widgets. Offline suite now `test_ambient.py` (19) including
+      widgets. Offline suite now `test_ambient.py` (23) including
       `test_control_socket_algo`, `test_reactivity_mapping`,
       `test_control_socket_reactivity`, `test_send_command`, plus `test_tray.py`
-      (4) covering the speed-panel sync/debounce/mid-drag logic over an
-      offscreen Qt. **Shipped as a user service (2026-09-18):**
+      (5) covering the icon render + speed-panel sync/debounce/mid-drag logic
+      over an offscreen Qt. **Shipped as a user service (2026-09-18):**
       `ambient-tray.service` installed + enabled and running — see the
       `ambienttray` section below.
+- [x] **Persistence milestone (2026-09-18)** — live `algo` + `reactivity`
+      choices now survive a daemon restart. `ambient.py` gained `state_path()`
+      (`$XDG_STATE_HOME`/`~/.local/state` + `/ambient/state.json`),
+      `load_saved_control()`, `save_control_state(algo, reactivity)` (atomic
+      tmp + `os.replace`), and `Ambient._resolve_control(cfg)` with precedence
+      **explicit CLI flags > saved state > tuned defaults**; `_handle_command`
+      persists on every `algo`/`reactivity` command. Defaults for `--algo` /
+      `--alpha` / `--max-step` became `None` and a custom `_Formatter` hides
+      `(default: None)`. New tests: `test_saved_control_roundtrip`,
+      `test_ambient_restart_restores_saved_state`,
+      `test_ambient_explicit_flags_override_saved`, `test_control_socket_persists`;
+      the suite sets `XDG_STATE_HOME` to a temp dir for isolation. **Verified
+      live (2026-09-18):** `ambientctl algo kmeans` + `reactivity 70` wrote
+      `{"algo": "kmeans", "reactivity": 70.0}`, a `systemctl --user restart`
+      brought the daemon back at kmeans / R70, then `circular` / `50` restored
+      the defaults (state file updated). Also hardened `_ctl_client` to swallow
+      the `ConnectionResetError` when a client times out mid-reply (journal was
+      spamming unhandled-exception tracebacks).
 
 Current milestone: Step 4 tuning (needs live tuning on a range of wallpapers);
 Step 5 (install/enable + live socket control under systemd) is done and fully
@@ -103,7 +121,7 @@ enabled, 2026-09-18).
 
 Full pipeline is: `capture.py` → `coloralg.py` → smoother (circular EMA in
 `ambient.py`) → `ledctl_lib.Strip` (reconnectable BLE writer). The offline
-suites `test_coloralg.py` (4), `test_ambient.py` (19) and `test_tray.py` (4)
+suites `test_coloralg.py` (4), `test_ambient.py` (23) and `test_tray.py` (5)
 pass on this host. The daemon is installed + enabled as `ambient.service` and
 running; the tray (`ambienttray`) is run manually for now.
 
@@ -274,6 +292,14 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
 - Flags: `--algo --brightness --width/--height --tick --alpha --min-delta
   --max-step --reactivity --change-threshold --heartbeat --timeout --retry
   --stop-state off|last --no-write --socket`.
+- **Persisted live control (2026-09-18).** `algo` + `reactivity` set over the
+  socket are written atomically to `state_path()` =
+  `$XDG_STATE_HOME|~/.local/state` + `/ambient/state.json`. Startup precedence
+  in `Ambient._resolve_control(cfg)`: explicit CLI flags (`--reactivity`, then
+  `--alpha`/`--max-step`, then `--algo`) > saved state > `DEFAULT_ALPHA` 0.4 /
+  `DEFAULT_MAX_STEP` 8.0 (reactivity 50). `--algo`/`--alpha`/`--max-step` default
+  to `None`; `parse_args` uses a `_Formatter` that hides `(default: None)`.
+  `load_saved_control()` returns `{}` on missing/corrupt JSON.
 - **Portal-Start hardening (2026-09-18).** The KWin consent handshake (portal
   `Start`) is a blocking call that can sit unanswered indefinitely. It now runs
   on a **daemon thread with a cancellable poll**, not the asyncio default
@@ -290,7 +316,8 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
   tracking/hold, writer power-on + delta gate + heartbeat, suspend/release/
   resume, the control socket (real unix socket, status/on/off/algo/reactivity/
   unknown, `send_command` round-trip + failure), the reactivity↔params mapping,
-  and `default_socket_path` resolution (fake capture/strip, no hardware).
+  `state.json` save/load + restart precedence + socket persistence, and
+  `default_socket_path` resolution (fake capture/strip, no hardware).
 
 ### `ambientctl` — control + systemd install CLI (Step 5)
 
@@ -335,8 +362,10 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
 ```
 
 - PySide6 (native StatusNotifier on Plasma; 6.11 moved `QAction` to `QtGui`).
-  Shows the strip's current hue as a coloured status dot (hue → QColor), polls
-  the daemon every 1 s, degrades gracefully offline.
+  Icon is minimal white line-art: a light-bulb outline (`render_icon`) whose
+  glass is filled with the current hue (~20% of the icon area); rendered
+  natively at 16/22/24/32/48/64 px so the 1px strokes stay crisp. Polls the
+  daemon every 1 s, degrades gracefully offline.
 - **Left-click** toggles sync on/off (same as `ambientctl on|off` — releases
   the BLE link while paused, so a phone app can use the strip). Right-click
   menu: status line, Pause/Resume checkable toggle, **Colour algorithm** radio
@@ -350,8 +379,9 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
   `ambienttray` builds it (Qt imported lazily so the module still imports
   headless for `install`); it debounces 120 ms, blocks echo writes while
   dragging, and `sync(level, alpha, max_step)` reflects daemon state.
-- Icon states: hue colour = running+linked; amber = running, no strip link;
-  green = linked, no hue yet; grey = paused or daemon unreachable.
+- Icon states (bulb glass fill, outline always white): hue = running+linked;
+  amber = running, no strip link; green = linked, no hue yet; grey = paused or
+  daemon unreachable.
 - The tray is deliberately independent of the daemon (it's a socket client, not
   a part of the pipeline). It installs its own `ambient-tray.service`
   (`After=graphical-session.target`, `PartOf=`, `Restart=on-failure`) with the
@@ -365,9 +395,10 @@ smoother → `ledctl_lib.Strip`. Three cooperating asyncio tasks:
   flickers to "no strip" until the next poll.
 - Shares `ledctl_lib.send_command` / `default_socket_path` with `ambientctl`.
   No `.py` suffix (loaded via importlib when reused in tests). `test_tray.py`
-  (4) exercises `send_or_none` plus the speed-panel over an offscreen
-  `QApplication` (sync/commit-debounce/mid-drag-ignore); it skips the Qt tests
-  cleanly if PySide6 is missing.
+  (5) exercises the icon render (`render_icon`, multi-size, ~20% accent fill),
+  `send_or_none`, and the speed-panel over an offscreen `QApplication`
+  (sync/commit-debounce/mid-drag-ignore); it skips the Qt tests cleanly if
+  PySide6 is missing.
 
 ### `test_device.py` — raw frame tester
 
