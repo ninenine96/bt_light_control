@@ -10,8 +10,10 @@ import os
 import socket
 import tempfile
 
-# isolate the persisted live-control state (and the portal token) from the host
-os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="ambient-test-state-")
+# isolate the persisted live-control state (and the portal token) from the host.
+# run_tests.py / conftest.py supply a per-run dir; direct execution falls back
+# to a fresh temp dir.
+os.environ.setdefault("XDG_STATE_HOME", tempfile.mkdtemp(prefix="ambient-test-state-"))
 
 from control_socket import (  # noqa: E402
     ControlServer,
@@ -127,14 +129,14 @@ def test_control_socket_reactivity():
             await asyncio.sleep(0.15)
             try:
                 st = await asyncio.to_thread(_sock_cmd, a.socket_path, "status")
-                assert st["reactivity"] == 50.0
-                assert st["alpha"] == 0.4 and st["max_step"] == 8.0
+                assert st["reactivity"] == 0.0
+                assert st["alpha"] == 0.5 and st["max_step"] == 10.0
 
                 ok = await asyncio.to_thread(_sock_cmd, a.socket_path, "reactivity 80")
                 assert ok["ok"] and ok["reactivity"] == 80.0
                 st2 = await asyncio.to_thread(_sock_cmd, a.socket_path, "status")
                 assert st2["reactivity"] == 80.0
-                assert st2["alpha"] == 0.61 and st2["max_step"] == 12.2
+                assert st2["alpha"] == 0.9 and st2["max_step"] == 74.0
 
                 for bad in ("reactivity", "reactivity abc", "reactivity 150",
                             "reactivity -1"):

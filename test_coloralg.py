@@ -4,18 +4,13 @@ Run with:  python3 test_coloralg.py
 """
 
 import colorsys
-import math
 import os
 import random
 
 from coloralg import (
-    circular_mean_hue,
-    hue_histogram,
-    kmeans_cluster,
-    average_rgb,
     ALGORITHMS,
+    circular_mean_hue,
 )
-
 
 # ---------------------------------------------------------------------------
 # tiny pixel-grid generators (no Pillow needed)
@@ -41,8 +36,6 @@ def noisy(
     spread: int = 15,
 ) -> list[tuple[int, int, int]]:
     """n pixels of base ± random spread (per channel)."""
-    lo = max(0, base[0] - spread)
-    hi = min(255, base[0] + spread)
     px = []
     for _ in range(n):
         px.append(tuple(max(0, min(255, c + random.randint(-spread, spread))) for c in base))

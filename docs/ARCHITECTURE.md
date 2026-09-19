@@ -59,6 +59,7 @@ Entry-point filenames are intentionally stable: the installed user units'
 | Screen capture / portal consent | `capture.py` |
 | CLI flags, tuned defaults, persisted state, reaction-speed curve | `settings.py` |
 | Daemon task wiring, gating, heartbeats, socket commands | `daemon.py` |
+| Control-panel ack blink (blink twice on a live change) | `daemon.py` (`_request_ack` / `_maybe_blink`) |
 | Socket path / line protocol / client | `control_socket.py` |
 | Tray menu, slider, tooltip, status polling | `ambienttray` |
 | Tray icon artwork | `tray_icon.py` |
@@ -75,8 +76,11 @@ Entry-point filenames are intentionally stable: the installed user units'
 - **Entry points are thin shims**; all logic lives in importable modules.
 - Tests mirror modules: `test_hue.py`, `test_settings.py`, `test_daemon.py`,
   `test_control_socket.py`, `test_tray.py`, `test_tray_icon.py`, `test_log.py`,
-  `test_coloralg.py`.  Run them all with `python3 run_tests.py`
-  (`test_device.py` is excluded — it talks to real hardware at import).
+  `test_capture.py`, `test_coloralg.py`.  Run them all with `python3 run_tests.py`
+  (subprocess-isolated) or `pytest` — `conftest.py` gives every test a fresh
+  `$XDG_STATE_HOME` (`test_device.py` is excluded — it talks to real hardware at
+  import).  `ruff check .` lints `.py` plus the extensionless `ambientctl` /
+  `ambienttray` (config in `pyproject.toml`).
 - Protocol, operational gotchas and calibration notes live in `AGENTS.md`,
   `docs/protocol.md` and `docs/troubleshooting.md`.
 - **Logging** goes to stderr (→ journald under the units) via `log.py`, which

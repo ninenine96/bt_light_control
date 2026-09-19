@@ -51,7 +51,6 @@ from control_socket import ControlServer, default_socket_path
 from hue import circular_arc, circular_ema, frame_change, hue_to_rgb, step_toward_hue
 from led_protocol import FRAME_OFF, FRAME_ON, color_frame
 from settings import (
-    HEARTBEAT_INTERVAL,
     MIN_WRITE_INTERVAL,
     reactivity_to_params,
     resolve_control,
@@ -63,6 +62,13 @@ class _UserStop(Exception):
     """Ask the writer task to finish because the user requested shutdown."""
 
 
+# Control-panel acknowledgement: a quick two-pulse blink so the strip visibly
+# confirms a live change (algo / reactivity / on / off) from `ambientctl` or the
+# tray.  The writer owns the link, so this runs inside its task (see _maybe_blink).
+ACK_BLINK_OFF_S = 0.12
+ACK_BLINK_ON_S = 0.16
+
+
 class Daemon:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -72,6 +78,7 @@ class Daemon:
         self._stop = asyncio.Event()
         self._notify = asyncio.Event()
         self._paused = asyncio.Event()      # set = `ambientctl off` (ambient suspended)
+        self._ack = asyncio.Event()         # writer blinks twice to confirm a change
         self._target: dict | None = None    # latest {"hue": <deg>} from producer
         self._last_written_hue: float | None = None
         self._last_write_t = 0.0
@@ -129,6 +136,7 @@ class Daemon:
             try:
                 ok = await self._start_capture(cap)
             except capture.CaptureUnavailableError:
+                cap.close()  # release any partially started pipeline
                 raise  # no capture backend at all -> fail fast, systemd restarts
             except Exception as exc:
                 if self._stop.is_set():
@@ -196,7 +204,7 @@ class Daemon:
         except asyncio.CancelledError:
             conn.cancel()
             await conn
-            raise _UserStop()
+            raise _UserStop() from None
         if stop in done:
             conn.cancel()
             try:
@@ -219,11 +227,58 @@ class Daemon:
             raise BleakError("strip not connected after connect() returned")
         return True
 
+    async def _maybe_blink(self) -> None:
+        """Acknowledge a pending control change with a two-pulse blink.
+
+        Cosmetic and best-effort: a no-op in ``--no-write`` dry runs or when the
+        link is down, and a failed write only forces a re-sync on the next loop
+        (it is never allowed to raise into the writer).  Runs on the writer task
+        so it never fights the normal gated writes.
+        """
+        if not self._ack.is_set():
+            return
+        self._ack.clear()
+        if self.cfg.no_write or not self.strip.connected:
+            return
+        hue = self._last_written_hue
+        if hue is None and self._target is not None:
+            hue = self._target["hue"]
+        colour = color_frame(*hue_to_rgb(hue if hue is not None else 0.0,
+                                         self.cfg.brightness))
+        black = color_frame(0, 0, 0)
+        try:
+            for _ in range(2):                      # on, off, on, off
+                await self.strip.write(black)
+                await asyncio.sleep(ACK_BLINK_OFF_S)
+                await self.strip.write(colour)
+                await asyncio.sleep(ACK_BLINK_ON_S)
+            self._last_write_t = time.monotonic()
+        except (BleakError, ConnectionError, OSError) as exc:
+            self._last_written_hue = None           # re-sync after reconnect
+            if self._link_warn.ready():
+                log.warning(f"[led] ack blink failed ({type(exc).__name__}): {exc}")
+
     async def _writer(self) -> None:
+        """Run the writer loop; surface an unexpected error as one log + stop.
+
+        The inner loop already recovers from BLE faults, so anything reaching
+        here is a genuine bug: log it and shut the daemon down cleanly instead
+        of dying with a bare traceback (systemd's Restart=on-failure picks it up).
+        """
+        try:
+            await self._writer_loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error(f"[led] writer crashed: {type(exc).__name__}: {exc}")
+            self.stop()
+
+    async def _writer_loop(self) -> None:
         while not self._stop.is_set():
             # --- paused: release the link and wait for `on` (or stop) --------
             if self._paused.is_set():
                 if self.strip.connected:
+                    await self._maybe_blink()   # acknowledge the pause first
                     await self.strip.disconnect()
                     log.notice("[led] paused \u2014 link released")
                 while not self._stop.is_set() and self._paused.is_set():
@@ -241,6 +296,7 @@ class Daemon:
                     self._last_written_hue = None
                     # allow the (re-)synced colour to fire immediately
                     self._last_write_t = time.monotonic() - MIN_WRITE_INTERVAL
+                    await self._maybe_blink()   # acknowledge a resume
                 except _UserStop:
                     return
                 except (BleakError, ConnectionError, OSError) as exc:
@@ -256,10 +312,12 @@ class Daemon:
                 if self._paused.is_set():
                     self._notify.clear()
                     break
+                if self._ack.is_set():
+                    await self._maybe_blink()   # acknowledge a live setting change
                 try:
                     # fresh targets wake instantly; a pending one polls fast
                     await asyncio.wait_for(self._notify.wait(), timeout=0.1)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
                 except asyncio.CancelledError:
                     raise
@@ -339,6 +397,11 @@ class Daemon:
 
     # -- Unix-socket control (semantics for control_socket.ControlServer) -------
 
+    def _request_ack(self) -> None:
+        """Ask the writer to blink twice, confirming a control change visually."""
+        self._ack.set()
+        self._notify.set()
+
     def handle_command(self, line: str) -> dict:
         """One control command -> a JSON-serialisable reply."""
         words = line.strip().lower().split()
@@ -362,21 +425,26 @@ class Daemon:
                 "uptime": round(time.monotonic() - self._start, 1),
             }
         if cmd == "on":
-            self._paused.clear()
-            log.notice("[ctl] resume (on)")
+            if self._paused.is_set():
+                self._paused.clear()
+                self._request_ack()
+                log.notice("[ctl] resume (on)")
             return {"ok": True, "paused": self._paused.is_set()}
         if cmd == "off":
-            self._paused.set()
-            self._notify.clear()
-            log.notice("[ctl] pause (off)")
+            if not self._paused.is_set():
+                self._paused.set()
+                self._notify.clear()
+                self._request_ack()
+                log.notice("[ctl] pause (off)")
             return {"ok": True, "paused": self._paused.is_set()}
         if cmd == "algo":
             if len(words) < 2 or words[1] not in ALGORITHMS:
                 return {"ok": False,
                         "error": f"algo must be one of: {', '.join(sorted(ALGORITHMS))}"}
-            if words[1] != self.cfg.algo:   # avoid noisy log spam on repeat
+            if words[1] != self.cfg.algo:   # only on an actual change
+                self.cfg.algo = words[1]
+                self._request_ack()
                 log.notice(f"[ctl] algo -> {words[1]}")
-            self.cfg.algo = words[1]
             save_control_state(self.cfg.algo, self.cfg.reactivity)
             return {"ok": True, "algo": self.cfg.algo}
         if cmd == "reactivity":
@@ -388,10 +456,13 @@ class Daemon:
                 return {"ok": False, "error": "reactivity must be a number 0-100"}
             if not 0.0 <= r <= 100.0:
                 return {"ok": False, "error": "reactivity must be 0-100"}
+            changed = round(r, 1) != self.cfg.reactivity
             self.cfg.reactivity = round(r, 1)
             self.cfg.alpha, self.cfg.max_step = reactivity_to_params(r)
-            log.notice(f"[ctl] reactivity -> {self.cfg.reactivity} "
-                       f"(alpha={self.cfg.alpha} max_step={self.cfg.max_step})")
+            if changed:
+                self._request_ack()
+                log.notice(f"[ctl] reactivity -> {self.cfg.reactivity} "
+                           f"(alpha={self.cfg.alpha} max_step={self.cfg.max_step})")
             save_control_state(self.cfg.algo, self.cfg.reactivity)
             return {"ok": True, "reactivity": self.cfg.reactivity,
                     "alpha": self.cfg.alpha, "max_step": self.cfg.max_step}

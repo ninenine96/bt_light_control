@@ -7,8 +7,10 @@ import asyncio
 import os
 import tempfile
 
-# isolate the persisted live-control state (and the portal token) from the host
-os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="ambient-test-state-")
+# isolate the persisted live-control state (and the portal token) from the host.
+# run_tests.py / conftest.py supply a per-run dir; direct execution falls back
+# to a fresh temp dir.
+os.environ.setdefault("XDG_STATE_HOME", tempfile.mkdtemp(prefix="ambient-test-state-"))
 
 import daemon as daemon_mod  # noqa: E402
 from daemon import Daemon  # noqa: E402
@@ -293,6 +295,56 @@ def test_writer_suspend_releases_and_resumes_link():
           f"link idle after pause")
 
 
+def test_handle_command_requests_ack():
+    print("\n[Test] handle_command flags an ack only on a real change")
+    a = Daemon(parse_args(["--no-write"]))
+    assert not a._ack.is_set()
+    a.handle_command("algo kmeans")
+    assert a._ack.is_set(), "algo change should request an ack"
+    a._ack.clear()
+    a.handle_command("algo kmeans")          # unchanged -> no blink
+    assert not a._ack.is_set()
+    a.handle_command("reactivity 80")
+    assert a._ack.is_set(), "reactivity change should request an ack"
+    a._ack.clear()
+    a.handle_command("reactivity 80")        # unchanged -> no blink
+    assert not a._ack.is_set()
+    a.handle_command("on")                   # already running -> no blink
+    assert not a._ack.is_set()
+    a.handle_command("off")
+    assert a._ack.is_set(), "pause should request an ack"
+    print("  OK    ack raised for algo/reactivity/off changes, not repeats")
+
+
+def test_writer_ack_blink():
+    print("\n[Test] writer: a control change triggers a two-pulse ack blink")
+    cfg = parse_args(["--min-delta", "10", "--heartbeat", "0", "--tick", "0.01"])
+    a = Daemon(cfg)
+    fake = FakeStrip()
+    a.strip = fake
+
+    mark = {"before": 0}
+
+    async def go():
+        task = asyncio.create_task(a._writer())
+        a._target = {"hue": 120.0}
+        a._notify.set()
+        await asyncio.sleep(0.4)             # connect + first colour write
+        mark["before"] = len(fake.writes)
+        a._request_ack()                     # as if the tray changed algo
+        await asyncio.sleep(0.9)             # blink is ~0.56 s
+        a.stop()
+        await task
+
+    asyncio.run(go())
+    blink = fake.writes[mark["before"]:]
+    black = color_frame(0, 0, 0)
+    colour = color_frame(*hue_to_rgb(120.0, 100))
+    assert blink.count(black) == 2, f"expected 2 dark pulses: {blink}"
+    assert blink.count(colour) == 2, f"expected 2 colour restores: {blink}"
+    print("  OK    2 dark pulses + 2 colour restores, latest colour kept")
+
+
 if __name__ == "__main__":
     import os
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -304,4 +356,6 @@ if __name__ == "__main__":
     test_writer_sweeps_large_change()
     test_writer_heartbeat()
     test_writer_suspend_releases_and_resumes_link()
+    test_handle_command_requests_ack()
+    test_writer_ack_blink()
     print("\n✅ All daemon tests passed.\n")

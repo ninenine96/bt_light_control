@@ -103,6 +103,11 @@ class ControlServer:
             pass
         server = await asyncio.start_unix_server(self._serve_client, path=self.path)
         try:
+            # owner-only: the socket accepts control commands (no auth handshake)
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+        try:
             await self.app.stop_event.wait()
         finally:
             server.close()

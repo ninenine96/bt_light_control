@@ -17,8 +17,10 @@ verified against the real hardware on a Linux host.
 [display] → capture.py → coloralg.py → circular EMA smoother → BLE writer → [strip]
 ```
 
-Only one hard runtime dependency: [`bleak`](https://github.com/hbldh/bleak).
-No numpy, no Pillow needed on the capture path.
+Runtime deps are [`bleak`](https://github.com/hbldh/bleak) (the daemon) and
+PySide6 (the tray) — see `requirements.txt`; screen capture additionally needs
+the system PyGObject + GStreamer `pipewiresrc`. No numpy, no Pillow needed on
+the capture path.
 
 ## Quick start
 
@@ -70,9 +72,10 @@ If `ambient.py --mac …` can't find the device, see
 | `test_device.py` | Raw frame tester for protocol/colour-order calibration |
 
 Every script's full usage is in [docs/usage.md](docs/usage.md); the module map
-is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Offline suites
-(`test_hue`, `test_settings`, `test_daemon`, `test_control_socket`, `test_tray`,
-`test_tray_icon`, `test_coloralg`) run with `python3 run_tests.py`.
+is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The offline suites
+(`test_capture`, `test_coloralg`, `test_hue`, `test_settings`, `test_daemon`,
+`test_control_socket`, `test_tray`, `test_tray_icon`, `test_log`) run with
+`python3 run_tests.py` or `pytest`, and `ruff check .` lints the tree.
 
 ## The ambient pipeline
 
@@ -106,19 +109,23 @@ See [docs/protocol.md](docs/protocol.md) for the wire protocol and
 
 ## Tuning
 
-The defaults (`--alpha 0.4`, `--min-delta 0.5`, `--max-step 8.0`,
+The defaults (`--alpha 0.5`, `--min-delta 0.5`, `--max-step 10`,
 `--change-threshold 2.0`) are a good starting point. `--max-step` bounds the hue
-change per BLE write (8°/write at ~5 Hz ≈ 40°/s), so a wallpaper switch glides
+change per BLE write (10°/write at ~5 Hz ≈ 50°/s), so a wallpaper switch glides
 across the wheel instead of snapping. Sandbox with `ambient.py --no-write` +
 real capture to tune.
 
 For live tuning there's a single **reaction-speed** knob: `--reactivity 0-100`
 (or `ambientctl reactivity N`, or the tray's slider). It sets *both* `--alpha`
-and `--max-step` on one axis — left is smooth/slow, right is quick/responsive —
-with `50` reproducing the tuned defaults (α 0.4, 8°/write). No restart needed.
-Both `algo` and `reactivity` survive daemon restarts (see above); an explicit
-CLI flag (`--algo`, `--reactivity`, `--alpha`/`--max-step`) always wins over the
-saved choice.
+and `--max-step` on one axis — left is calm, right is instant. The range was
+retuned so the unusably slow bottom half is gone: `0` = α 0.5 / 10°/write
+(≈50°/s, the defaults) and `100` = α 1.0 / 90°/write (≈450°/s — a half-wheel
+swing in ~0.4 s). No restart needed. Both `algo` and `reactivity` survive daemon
+restarts (see above); an explicit CLI flag (`--algo`, `--reactivity`,
+`--alpha`/`--max-step`) always wins over the saved choice.
+
+Every change made from the tray or `ambientctl` (`algo`, `reactivity`, `on`,
+`off`) makes the strip **blink twice** as visual confirmation.
 
 Choose a different hue algorithm with `--algo` (or `ambientctl algo NAME`, or
 the tray's radio menu):

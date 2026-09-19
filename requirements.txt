@@ -1,0 +1,10 @@
+# Runtime dependencies for the ambient hue-sync daemon + tray.
+#
+# PyGObject (`gi`) and the GStreamer `pipewiresrc` plugin are system packages,
+# not pip-installable here — install them with your distro, e.g.
+#   Fedora:  sudo dnf install python3-gobject gstreamer1-plugin-pipewire
+#   Debian:  sudo apt install python3-gi gstreamer1.0-pipewire
+#
+# numpy and Pillow are deliberately NOT dependencies (see PLAN.md).
+bleak>=0.22
+PySide6>=6.6

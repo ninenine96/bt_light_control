@@ -98,6 +98,37 @@ def test_speed_panel_ignores_sync_mid_drag():
     print("  OK    mid-drag sync ignored, no echo write")
 
 
+def test_tray_class_status_mapping():
+    print("\n[Test] Tray class maps daemon status onto the widgets")
+    if not HAS_QT:
+        print("  SKIP  PySide6 not installed")
+        return
+    app = _app()
+    mod = ambienttray
+    tray = mod.Tray(app, "/tmp/definitely-not-a-socket.sock")
+    # offline: no daemon -> pause disabled, start offered
+    assert tray.state["online"] is False
+    assert tray.toggle.isEnabled() is False
+    assert tray.start_act.isEnabled() is True
+
+    tray.apply_status({
+        "paused": False, "connected": True, "hue": 120.0, "algo": "kmeans",
+        "reactivity": 80.0, "alpha": 0.61, "max_step": 12.2,
+    })
+    assert tray.state["online"] is True and tray.state["running"] is True
+    assert tray.state["hue"] == 120.0
+    assert tray.toggle.isEnabled() and tray.toggle.isChecked()
+    assert tray.algo_actions["kmeans"].isChecked()
+    assert not tray.algo_actions["circular"].isChecked()
+    assert "R80" in tray.speed_act.text(), tray.speed_act.text()
+    assert tray.start_act.isEnabled() is False and tray.stop_act.isEnabled() is True
+
+    tray.apply_status(None)                      # daemon went away again
+    assert tray.state["online"] is False
+    assert tray.toggle.isEnabled() is False
+    print("  OK    online/offline transitions update icon state + menu actions")
+
+
 if __name__ == "__main__":
     import os
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -105,4 +136,5 @@ if __name__ == "__main__":
     test_speed_panel_sync()
     test_speed_panel_commit_debounced()
     test_speed_panel_ignores_sync_mid_drag()
+    test_tray_class_status_mapping()
     print("\n✅ All tray tests passed.\n")

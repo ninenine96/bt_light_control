@@ -125,7 +125,7 @@ class Strip:
                     break
                 try:
                     await asyncio.wait_for(self._seen.wait(), remaining)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     break
                 addr = self._watch_addr
                 if not addr:
@@ -139,7 +139,7 @@ class Strip:
                 if self.address is None:
                     self.address = addr
                 return
-            except (BleakError, asyncio.TimeoutError, OSError):
+            except (TimeoutError, BleakError, OSError):
                 self._client = None
                 await self._watch_start()  # keep listening while we back off
                 await asyncio.sleep(backoff)

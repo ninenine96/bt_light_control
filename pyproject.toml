@@ -1,0 +1,21 @@
+# Tooling config for the ambient hue-sync daemon (flat, no package layout).
+# Runtime deps: see requirements.txt. Tests run either via `run_tests.py`
+# (subprocess-isolated, canonical) or `pytest`.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# entry points ambientctl/ambienttray have no .py suffix; lint them explicitly
+include = ["*.py", "ambientctl", "ambienttray"]
+extend-exclude = ["__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+# long docstrings / URL lines are fine; real syntax/lint issues still surface
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+# test_device.py performs raw BLE I/O at import (module-level asyncio.run)
+addopts = "-q --ignore=test_device.py"

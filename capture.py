@@ -13,9 +13,11 @@ Design (see PLAN.md):
     ("target not found"), hence the direct socket.
   - GStreamer ('gst-launch-1.0') downscales (SIMD) to a tiny RGBA frame
     (default 48×27) and writes raw bytes to a pipe.
-  - {capture.py}.read_frame() consumes exactly one frame (w*h*4 bytes) per call,
-    so the capture tick rate is set by the caller, not by GStreamer. The leaky
-    queue drops stale buffers, so videoscale only runs at consumption rate.
+  - A reader thread reassembles exactly one frame (w*h*4 bytes) at a time and
+    keeps only the newest in a single-slot buffer; {capture.py}.read_frame()
+    takes and clears it. The consumer's tick rate therefore sets the capture
+    rate, and memory stays bounded to one frame (the leaky queue upstream drops
+    stale buffers).
 
 Platforms: KWin/Wayland (this host) — graceful error otherwise. Pure-stdlib +
 pygobject + GStreamer; no Pillow needed for the portal path.
@@ -30,6 +32,7 @@ import sys
 import threading
 import time
 
+import log
 from paths import state_dir, state_file
 
 try:
@@ -141,7 +144,8 @@ class _PortalCall:
             self._on_response,
             (loop, handle_token),
         )
-        GLib.timeout_add(signal_timeout_ms(timeout_s * 1000), self._on_timeout, loop)
+        timeout_id = GLib.timeout_add(signal_timeout_ms(timeout_s * 1000),
+                                      self._on_timeout, loop)
 
         # push the AddMatch for our subscription out to the bus NOW, so the
         # match rule is live before the portal can reply (replies can beat us).
@@ -173,6 +177,12 @@ class _PortalCall:
             worker.join(timeout=1.0)
         finally:
             self._bus.signal_unsubscribe(sub_id)
+            # the response usually beats the timeout; drop the pending source so
+            # it does not linger on the (now finished) main loop
+            try:
+                GLib.source_remove(timeout_id)
+            except Exception:
+                pass
 
         if self._call_err:
             raise self._call_err
@@ -203,18 +213,16 @@ def signal_timeout_ms(ms: int) -> int:
 class ScreenCapture:
     """Manage the portal session + GStreamer subprocess that yields RGBA frames."""
 
-    def __init__(self, width: int = DEFAULT_WIDTH, height: int = DEFAULT_HEIGHT,
-                 mac: str | None = None):
+    def __init__(self, width: int = DEFAULT_WIDTH, height: int = DEFAULT_HEIGHT):
         self.width = width
         self.height = height
-        self.mac = mac
         self._fd: int | None = None
         self._node_id: int | None = None
         self._sock: socket.socket | None = None
         self._proc: subprocess.Popen | None = None
         self._frame_size = width * height * 4
         self._reader: threading.Thread | None = None
-        self._frames: list[bytes] = []
+        self._latest: bytes | None = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
 
@@ -226,7 +234,7 @@ class ScreenCapture:
 
     def _open_pipewire_fd(self) -> int:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-        print("[capture] CreateSession...", flush=True, file=sys.stderr)
+        log.debug("[capture] CreateSession...")
         session = _PortalCall(bus).call(
             "CreateSession",
             "(a{sv})",
@@ -234,12 +242,12 @@ class ScreenCapture:
         )[1].get("session_handle")
         if not session:
             raise PortalError("CreateSession: no session_handle in response")
-        print(f"[capture] session={session}", flush=True, file=sys.stderr)
+        log.debug(f"[capture] session={session}")
 
         # select monitors (types=1 → monitor); signature (oa{sv}) — no parent.
         # persist_mode=2 + a previously-granted restore_token makes KWin skip
         # its consent dialog entirely (tokens are single-use; rotate below).
-        print("[capture] SelectSources...", flush=True, file=sys.stderr)
+        log.debug("[capture] SelectSources...")
         options: dict = {
             "types": GLib.Variant("u", 1),
             "multiple": GLib.Variant("b", False),
@@ -253,10 +261,10 @@ class ScreenCapture:
             "(oa{sv})",
             (session, options),
         )
-        print("[capture] SelectSources done", flush=True, file=sys.stderr)
+        log.debug("[capture] SelectSources done")
 
         # start the stream → response carries the selected stream size
-        print("[capture] Start... (KWin may pop a consent dialog once)", flush=True, file=sys.stderr)
+        log.info("[capture] Start... (KWin may pop a consent dialog once)")
         code_start, start_res = _PortalCall(bus).call(
             "Start",
             "(osa{sv})",
@@ -266,21 +274,20 @@ class ScreenCapture:
             raise PortalError(
                 f"Start rejected (code {code_start}). KWin may require an "
                 "interactive consent dialog; run once from a terminal.")
-        print("[capture] Start done", flush=True, file=sys.stderr)
+        log.debug("[capture] Start done")
 
         # rotate the single-use restore_token so the NEXT run restores silently
         new_token = start_res.get("restore_token") if start_res else None
         if isinstance(new_token, str) and new_token and new_token != prev_token:
             _save_restore_token(new_token)
-            print(f"[capture] restore_token rotated ({len(new_token)} chars)",
-                  flush=True, file=sys.stderr)
+            log.debug(f"[capture] restore_token rotated ({len(new_token)} chars)")
 
         # extract PipeWire node id from Start response streams
         streams = start_res.get("streams", []) if start_res else []
         node_id = streams[0][0] if streams else None
         if node_id is None:
             raise PortalError("Start returned no streams")
-        print(f"[capture] stream node_id={node_id}", flush=True, file=sys.stderr)
+        log.debug(f"[capture] stream node_id={node_id}")
 
         # PipeWire transport: the screencast node lives in the session PipeWire
         # daemon's registry. The portal's OpenPipeWireRemote fd does NOT work
@@ -298,7 +305,7 @@ class ScreenCapture:
             sock.connect(pipewire_socket)
         except OSError as exc:
             sock.close()
-            raise PortalError(f"cannot connect to session PipeWire: {exc}")
+            raise PortalError(f"cannot connect to session PipeWire: {exc}") from exc
         self._sock = sock
         return sock.fileno(), int(node_id)
 
@@ -345,24 +352,39 @@ class ScreenCapture:
         if self._proc.poll() is not None:
             err = self._proc.stderr.read().decode(errors="replace") if self._proc.stderr else ""
             raise PortalError(f"GStreamer exited immediately: {err.strip() or 'no error'}")
-        print(f"[capture] gst running pid={self._proc.pid}", flush=True, file=sys.stderr)
+        log.debug(f"[capture] gst running pid={self._proc.pid}")
 
     def _read_loop(self) -> None:
+        """Reassemble frame-sized chunks from the pipe, keeping only the newest.
+
+        ``stdout`` is an unbuffered raw pipe, so ``read(n)`` may return fewer
+        than n bytes (short read); accumulate until a full frame is available
+        or the pipe closes.  A partial trailing frame is discarded.
+        """
+        stdout = self._proc.stdout if self._proc else None
+        buf = b""
         while not self._stop_event.is_set():
-            chunk = self._proc.stdout.read(self._frame_size) if self._proc.stdout else b""
+            chunk = stdout.read(self._frame_size - len(buf)) if stdout else b""
             if not chunk:
                 break
-            with self._lock:
-                self._frames.append(chunk)
+            buf += chunk
+            if len(buf) == self._frame_size:
+                with self._lock:
+                    self._latest = buf
+                buf = b""
 
     # -- consumer API ----------------------------------------------------------
 
     def read_frame(self) -> bytes | None:
-        """Return the most recent full RGBA frame (width*height*4 bytes) or None."""
+        """Take the newest full RGBA frame (width*height*4 bytes), or None.
+
+        The frame is consumed: a subsequent call returns None until the next
+        frame arrives, so the caller's tick rate paces the capture.
+        """
         with self._lock:
-            if not self._frames:
-                return None
-            return self._frames.pop()
+            frame = self._latest
+            self._latest = None
+            return frame
 
     def read_frame_pixels(self) -> list[tuple[int, int, int]]:
         """Return the newest frame as a flat list of (R, G, B) tuples.

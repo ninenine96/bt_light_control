@@ -47,7 +47,7 @@ def frame_change(prev: list, curr: list) -> float:
     if not prev or len(prev) != len(curr):
         return 255.0
     acc = 0
-    for (r0, g0, b0), (r1, g1, b1) in zip(prev, curr):
+    for (r0, g0, b0), (r1, g1, b1) in zip(prev, curr, strict=True):
         acc += abs(r0 - r1) + abs(g0 - g1) + abs(b0 - b1)
     return acc / (3.0 * len(prev))
 

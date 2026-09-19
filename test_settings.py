@@ -6,10 +6,13 @@ Run with:  python3 test_settings.py
 import os
 import tempfile
 
-# isolate the persisted live-control state (and the portal token) from the host
-os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="ambient-test-state-")
+# isolate the persisted live-control state (and the portal token) from the host.
+# run_tests.py / conftest.py supply a per-run dir; direct execution falls back
+# to a fresh temp dir.
+os.environ.setdefault("XDG_STATE_HOME", tempfile.mkdtemp(prefix="ambient-test-state-"))
 
 from settings import (  # noqa: E402  (must follow the env isolation above)
+    DEFAULT_MAX_STEP,
     load_saved_control,
     params_to_reactivity,
     parse_args,
@@ -29,17 +32,19 @@ def _clear_state() -> None:
 
 def test_reactivity_mapping():
     print("\n[Test] reactivity <-> (alpha, max-step) mapping")
-    # the tuned default pair sits exactly at the slider midpoint
-    assert reactivity_to_params(50) == (0.4, 8.0)
+    # the tuned defaults now sit at the slider floor (the slow 60% was dropped)
+    assert reactivity_to_params(0) == (0.5, 10.0)
+    assert reactivity_to_params(50) == (0.75, 50.0)
+    assert reactivity_to_params(100) == (1.0, 90.0)
     a0, m0 = reactivity_to_params(0)
     a1, m1 = reactivity_to_params(100)
     assert a0 < a1 and m0 < m1, "reaction speed must increase monotonically"
-    assert params_to_reactivity(0.4, 8.0) == 50.0
+    assert params_to_reactivity(0.5, 10.0) == 0.0
     assert params_to_reactivity(0.4, 0) == 100.0   # 0 disables the step limit
     for r in (0, 25, 50, 75, 100):
         alpha, ms = reactivity_to_params(r)
         assert abs(params_to_reactivity(alpha, ms) - r) < 0.5, r
-    print("  OK    R=50 -> alpha 0.4 / max-step 8.0; monotonic; invertible")
+    print("  OK    R=0 -> alpha 0.5 / 10 deg, R=100 -> 1.0 / 90 deg; invertible")
 
 
 def test_saved_control_roundtrip():
@@ -66,7 +71,7 @@ def test_resolve_control_uses_saved():
         resolve_control(cfg)
         assert cfg.algo == "histogram", cfg.algo
         assert cfg.reactivity == 80.0, cfg.reactivity
-        assert (cfg.alpha, cfg.max_step) == (0.61, 12.2)
+        assert (cfg.alpha, cfg.max_step) == (0.9, 74.0)
     finally:
         _clear_state()
     print("  OK    resolve_control picks up histogram / R80 instead of defaults")
@@ -85,7 +90,7 @@ def test_resolve_control_flags_override():
         cfg2 = parse_args(["--no-write", "--alpha", "0.65"])
         resolve_control(cfg2)
         assert cfg2.alpha == 0.65
-        assert cfg2.reactivity == params_to_reactivity(0.65, 8.0)
+        assert cfg2.reactivity == params_to_reactivity(0.65, DEFAULT_MAX_STEP)
         assert cfg2.algo == "histogram"
     finally:
         _clear_state()

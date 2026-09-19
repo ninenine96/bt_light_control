@@ -31,10 +31,10 @@ from bleak.exc import BleakDeviceNotFoundError
 from ble_link import scan_for_strip
 from led_protocol import (
     CHAR_UUID,
-    FRAME_ON,
     FRAME_OFF,
-    NAMED_COLORS,
+    FRAME_ON,
     NAME_PREFIXES,
+    NAMED_COLORS,
     brightness_frame,
     color_frame,
     pattern_frame,
@@ -60,7 +60,7 @@ async def rainbow(address: str | None, duration_min: float, brightness: float,
     if not addr:
         print("No LEDDMX strip found in range.")
         sys.exit(1)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     stopped = asyncio.Event()
     t0 = loop.time()
     try:

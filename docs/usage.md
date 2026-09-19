@@ -54,10 +54,10 @@ python3 ambient.py --no-write                               # capture→colour o
 | `--brightness N` | 100 | LED brightness 0–100 |
 | `--width/--height N` | 48 / 27 | capture resolution (px) |
 | `--tick S` | 0.2 | capture/smoothing tick (s) |
-| `--alpha F` | 0.4 | hue EMA factor (0–1); higher = more responsive |
+| `--alpha F` | 0.5 | hue EMA factor (0–1); higher = more responsive |
 | `--min-delta DEG` | 0.5 | min hue arc (°) to trigger a BLE write |
-| `--max-step DEG` | 8.0 | max hue change (°) per BLE write — bounds transition speed so colour changes glide; `0` disables |
-| `--reactivity N` | unset | reaction-speed slider 0–100: sets BOTH `--alpha` and `--max-step` (`0`=smooth/slow, `50`=tuned defaults, `100`=quick). Overrides `--alpha`/`--max-step` when given; changeable live |
+| `--max-step DEG` | 10.0 | max hue change (°) per BLE write — bounds transition speed so colour changes glide; `0` disables |
+| `--reactivity N` | unset | reaction-speed slider 0–100: sets BOTH `--alpha` and `--max-step` (`0`=calm/default, `100`=instant). Overrides `--alpha`/`--max-step` when given; changeable live |
 | `--change-threshold F` | 2.0 | frame mean-abs-delta below which the screen is "static"; `-1` disables the short-circuit |
 | `--timeout S` | 60.0 | seconds to keep retrying a lost BLE link |
 | `--stop-state` | `off` | `off` powers the strip down on exit; `last` leaves it on the current colour |
@@ -94,8 +94,10 @@ python3 ambientctl uninstall             # remove the unit
   is free for a phone app while paused. `algo` validation errors list the
   available algorithms, and `status` reports the active `algo` (plus the full
   `algos` list) and `reactivity`/`alpha`/`max_step`. `reactivity` (0–100) is a
-  single smooth↔quick axis that sets both the tracking EMA and the per-write
-  transition sweep (`50` = the tuned defaults).
+  single calm↔instant axis that sets both the tracking EMA and the per-write
+  transition sweep (`0` = the defaults α 0.5 / 10°/write; `100` = α 1.0 /
+  90°/write). Every live change (`algo`, `reactivity`, `on`, `off`) makes the
+  strip **blink twice** as acknowledgement.
 - **Live control persists across restarts.** `algo NAME` and `reactivity N`
   write the choice to `~/.local/state/ambient/state.json` (atomically). When the
   daemon starts it prefers, in order: explicit CLI flags → the saved state →
@@ -129,11 +131,14 @@ python3 ambienttray uninstall
   ambient sync on/off; **right-click** menu has a Pause/Resume toggle, a
   Colour-algorithm radio list (from `coloralg.ALGORITHMS`), a **Reaction
   speed …** slider popup, and Start/Stop-daemon actions.
-- The **reaction-speed slider** (0–100, smooth/slow ↔ quick/responsive) sets
-  both the tracking EMA and the per-write transition sweep, so it's the same as
-  `ambientctl reactivity N`. It opens in a small popup window rather than inside
-  the menu, because Plasma renders tray menus over DBusMenu which cannot host
-  arbitrary widgets.
+- The **reaction-speed slider** (0–100, calm ↔ instant) sets both the tracking
+  EMA and the per-write transition sweep, so it's the same as
+  `ambientctl reactivity N`. The slow bottom of the old range was dropped:
+  `0` = α 0.5 / 10°/write, `100` = α 1.0 / 90°/write. It opens in a small popup
+  window rather than inside the menu, because Plasma renders tray menus over
+  DBusMenu which cannot host arbitrary widgets.
+- Changing anything from the tray (algorithm, reaction speed, pause/resume)
+  makes the strip **blink twice** to confirm the command landed.
 - The tray polls the daemon's control socket every 1 s and is fully
   independent of the pipeline — it keeps living (and can start the daemon)
   while the daemon is down. Requires PySide6:
@@ -162,9 +167,10 @@ c.close()
   `~/.local/state/ambient/restore_token` and rotated after every `Start`.
   (A granted token can be seeded from `flatpak permission-list` → `screencast`
   table to skip the very first dialog.)
-- `read_frame_pixels()` returns the **most recent** frame; GStreamer's leaky
-  queue drops stale buffers, so the capture rate is set by the caller, not by
-  the compositor.
+- `read_frame_pixels()` **consumes** the newest frame (the reader thread keeps
+  only one complete frame in a single slot and reassembles across short pipe
+  reads), so the capture rate is set by the caller, not the compositor, and
+  memory stays bounded to one small frame.
 
 ## `test_device.py` — raw frame tester
 

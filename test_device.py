@@ -9,9 +9,9 @@ This module executes BLE I/O at import, so it is NOT collected by run_tests.py.
 import asyncio
 import sys
 
-from bleak import BleakClient, BleakScanner
+from bleak import BleakClient
 
-from led_protocol import CHAR_UUID, FRAME_OFF, FRAME_ON, SERVICE_UUID
+from led_protocol import CHAR_UUID, FRAME_OFF, FRAME_ON
 
 ADDR = "41:42:9A:B1:2F:70"
 
@@ -33,7 +33,6 @@ async def connect_check(addr):
         client = BleakClient(addr, timeout=20)
         await client.connect()
         print(f"Connected: {client.is_connected}")
-        svc = client.services.resolve(SERVICE_UUID) if not client.services else client.services
         char = client.services.get_characteristic(CHAR_UUID)
         print(f"Char found: {char is not None}")
         if char:

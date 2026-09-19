@@ -127,12 +127,14 @@ defaults sane so the daemon runs with zero config.
    via the new `ledctl_lib.py` (refactored out of `ledctl.py`). Unit suite:
    `test_ambient.py`.
 4. Smoothing + thresholding; tune so a changing wallpaper morphs gracefully.
-    — Current defaults in `ambient.py`: `--alpha 0.4`, `--min-delta 0.5°`,
-    `--max-step 8.0°`, `--change-threshold 2.0`. `--max-step` (2026-09-18)
-    bounds hue per BLE write so large changes sweep (≈40°/s) instead of
+    — Current defaults in `settings.py`: `--alpha 0.5`, `--min-delta 0.5°`,
+    `--max-step 10.0°`, `--change-threshold 2.0`. `--max-step` (2026-09-18)
+    bounds hue per BLE write so large changes sweep (≈50°/s) instead of
     snapping; with `--no-write`, capture sweeps at exactly 10°/write in tests.
-    Sandbox with `--no-write` + real capture; Step 4 is mostly done pending
-    live tuning across wallpapers.
+    **Retuned 2026-09-19:** the reaction-speed slider's unusably slow bottom
+    ~60% was dropped and the top end raised to ≈450°/s (see step 9 / the
+    milestone in AGENTS.md). Sandbox with `--no-write` + real capture; the
+    remaining work is live preference only.
 5. ✅ systemd unit + socket control + `enable/disable` toggle.
     — **DONE (2026-09-18):** `ambientctl` (socket CLI + install helper) and the
     `ambient.py` control server. Verified with a real capture session
@@ -213,7 +215,36 @@ defaults sane so the daemon runs with zero config.
    (suite isolates `XDG_STATE_HOME` to a temp dir). **Live-verified
    (2026-09-18):** `algo kmeans` + `reactivity 70` wrote
    `{"algo": "kmeans", "reactivity": 70.0}`; a `systemctl --user restart` came
-   back at kmeans / R70; setting `circular` / `50` restored the defaults.
+    back at kmeans / R70; setting `circular` / `50` restored the defaults.
+9. ✅ Code-quality / robustness hardening (2026-09-19). A read-through of the
+   whole tree surfaced one real leak plus a batch of smaller issues; this step
+   cleared them in four phases (all landed + verified).
+   — **Phase 1 (bugs).** `capture.py` accumulated every frame in a Python list
+   (`_read_loop` appends, `read_frame` pops only the newest) → unbounded growth
+   (~600 KB/s at ~120 fps), and read raw `FileIO` short reads could desync
+   frames. Fix: a single latest-frame slot + a read-exact loop. Also:
+   `settings.parse_args` range validation (brightness/alpha/tick/width/…),
+   `dict[str, any]` → `dict[str, Any]`, drop the unused `_pixel_count`,
+   `asyncio.get_event_loop()` → `get_running_loop()` in `ledctl.py`, and drop
+   the unused `mac` arg on `ScreenCapture`.
+   — **Phase 2 (hardening).** `chmod 0600` the control socket;
+   remove the orphaned `GLib.timeout_add` source in `_PortalCall`; close the
+   capture object when `CaptureUnavailableError` aborts the producer; add a
+   top-level guard to the writer task so an unexpected error logs an `error`
+   line instead of a bare traceback; route `capture.py` handshake output through
+   `log.py` priorities.
+   — **Phase 3 (tooling).** `requirements.txt` + `pyproject.toml` (ruff +
+   pytest config); `conftest.py` autouse state isolation so the suites run under
+   both `run_tests.py` and `pytest`; dedupe the systemd unit rendering into
+   `systemd_user.render_user_unit`; extract the ~170-line `_run_tray` monolith
+   into a testable `Tray` class.
+   — **Phase 4 (perf).** single-pass HSV filtering in `coloralg.py` (one
+   `rgb_to_hsv` per pixel instead of two); `_kmeans_rgb` returns cluster sizes so
+   `kmeans_cluster` doesn't re-run the assignment pass.
+   **Verified (2026-09-19):** `run_tests.py` 9/9 suites and `pytest` 42 tests
+   pass; `ruff check .` clean; generated ambient unit byte-identical to the
+   installed one; tray offscreen smoke + new `Tray` status-mapping test pass;
+   CLI guards reject out-of-range flags.
 
 ## Performance / negligible-tax strategy
 

@@ -9,8 +9,10 @@ and needs a physical strip attached.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -19,10 +21,14 @@ EXCLUDE = {"test_device.py"}
 
 def main() -> int:
     suites = sorted(p.name for p in HERE.glob("test_*.py") if p.name not in EXCLUDE)
+    # one isolated state dir for the whole run; passed to every subprocess so no
+    # suite can touch the host's ~/.local/state/ambient
+    state = tempfile.mkdtemp(prefix="ambient-tests-")
+    env = {**os.environ, "XDG_STATE_HOME": state}
     failed: list[str] = []
     for name in suites:
         print(f"\n{'=' * 60}\n=== {name}\n{'=' * 60}")
-        rc = subprocess.run([sys.executable, name], cwd=HERE).returncode
+        rc = subprocess.run([sys.executable, name], cwd=HERE, env=env).returncode
         if rc != 0:
             failed.append(name)
     print(f"\n{'=' * 60}")

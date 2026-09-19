@@ -5,9 +5,9 @@ Two halves:
 
   1. **Reaction-speed mapping** — one 0-100 slider (tray / ``ambientctl
      reactivity``) drives BOTH the tracking EMA (``alpha``) and the per-write
-     transition sweep (``max_step``).  ``R=50`` reproduces the tuned defaults
-     exactly (alpha 0.4, max_step 8.0°); ``R=0`` is smoothest/slowest, ``R=100``
-     quickest.
+     transition sweep (``max_step``).  The range was retuned 2026-09-19 to drop
+     the unusably slow bottom ~60%: ``R=0`` is alpha 0.5 / 10°/write (the
+     defaults, ~50°/s) and ``R=100`` is alpha 1.0 / 90°/write (~450°/s).
   2. **Persistence + precedence** — the live ``algo``/``reactivity`` choices are
      written atomically to ``state.json`` and survive a daemon restart.
      ``resolve_control`` applies: explicit CLI flags > saved state > tuned
@@ -43,12 +43,17 @@ MIN_WRITE_INTERVAL = 0.2
 HEARTBEAT_INTERVAL = 5.0
 
 # "Reaction speed" slider <-> (alpha, max_step) mapping ranges.
-REACTIVITY_ALPHA_RANGE = (0.05, 0.75)
-REACTIVITY_MAX_STEP_RANGE = (1.0, 15.0)
-# the tuned defaults (== reactivity 50); used when neither the CLI nor the
-# persisted state pins a reaction speed
-DEFAULT_ALPHA = 0.4
-DEFAULT_MAX_STEP = 8.0
+# Retuned 2026-09-19: the old bottom ~60% (alpha 0.05-0.47, max_step 1-9 deg)
+# was unusably slow — a full sweep took tens of seconds — so the slider now
+# starts at roughly the old R60 point and the top end is ~6x faster than before
+# (alpha 1.0 reaches the target in a single producer tick; 90 deg/write at the
+# 5 Hz cap is ~450 deg/s, i.e. a half-wheel swing in ~0.4 s).
+REACTIVITY_ALPHA_RANGE = (0.5, 1.0)
+REACTIVITY_MAX_STEP_RANGE = (10.0, 90.0)
+# out-of-the-box reaction speed == the slider floor (R=0); used when neither the
+# CLI nor the persisted state pins a reaction speed
+DEFAULT_ALPHA = 0.5
+DEFAULT_MAX_STEP = 10.0
 
 
 def reactivity_to_params(r: float) -> tuple[float, float]:
@@ -149,18 +154,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--height", type=int, default=27, help="capture height px")
     p.add_argument("--tick", type=float, default=0.2, help="capture/smooth tick (s)")
     p.add_argument("--alpha", type=float, default=None,
-                   help="hue EMA factor (0-1); default 0.4")
+                   help="hue EMA factor (0-1); default 0.5")
     p.add_argument("--min-delta", type=float, default=0.5,
                    help="min hue arc (deg) to trigger a BLE write")
     p.add_argument("--max-step", type=float, default=None,
                    help="max hue change (deg) per BLE write; bounds transition "
                         "speed so colour changes glide rather than jump "
-                        "(0 disables the step limit); default 8.0")
+                        "(0 disables the step limit); default 10.0")
     p.add_argument("--reactivity", type=float, default=None,
                    help="reaction-speed slider 0-100: sets BOTH --alpha and "
-                        "--max-step (0=smooth/slow, 50=tuned defaults, "
-                        "100=quick). Overrides --alpha/--max-step when given; "
-                        "changeable live with `ambientctl reactivity N`")
+                        "--max-step (0=calm, 100=instant). Overrides "
+                        "--alpha/--max-step when given; changeable live with "
+                        "`ambientctl reactivity N`")
     p.add_argument("--change-threshold", type=float, default=2.0,
                    help="frame mean-abs-delta below which the screen is 'static' "
                         "(-1 disables the short-circuit)")
@@ -178,4 +183,32 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--socket", default=None,
                    help="control-socket path (default: "
                         "$AMBIENT_SOCKET, else $XDG_RUNTIME_DIR/ambient.sock)")
-    return p.parse_args(argv)
+    cfg = p.parse_args(argv)
+    _validate(p, cfg)
+    return cfg
+
+
+def _validate(p: argparse.ArgumentParser, cfg: argparse.Namespace) -> None:
+    """Reject out-of-range flags early, instead of failing deep in the pipeline."""
+    if not 0 <= cfg.brightness <= 100:
+        p.error("--brightness must be 0-100")
+    if cfg.width < 1 or cfg.height < 1:
+        p.error("--width/--height must be >= 1")
+    if cfg.tick <= 0:
+        p.error("--tick must be > 0")
+    if cfg.alpha is not None and not 0.0 < cfg.alpha <= 1.0:
+        p.error("--alpha must be in (0, 1]")
+    if cfg.reactivity is not None and not 0.0 <= cfg.reactivity <= 100.0:
+        p.error("--reactivity must be 0-100")
+    if cfg.min_delta < 0:
+        p.error("--min-delta must be >= 0")
+    if cfg.max_step is not None and cfg.max_step < 0:
+        p.error("--max-step must be >= 0 (0 disables the step limit)")
+    if cfg.change_threshold < -1:
+        p.error("--change-threshold must be >= -1")
+    if cfg.heartbeat < 0:
+        p.error("--heartbeat must be >= 0")
+    if cfg.timeout <= 0:
+        p.error("--timeout must be > 0")
+    if cfg.retry < 0:
+        p.error("--retry must be >= 0")

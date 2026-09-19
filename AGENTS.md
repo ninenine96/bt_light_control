@@ -137,7 +137,52 @@ Build order from PLAN.md — checked items are done and verified on this host:
       `test_daemon`, `test_control_socket`, `test_tray`, `test_tray_icon`,
       `test_log`) plus a new `run_tests.py` runner that excludes the
       hardware-only `test_device.py`. `docs/ARCHITECTURE.md` added (module map +
-      "to change X, edit Y"). All 8 suites pass as of 2026-09-19.
+      "to change X, edit Y").
+
+- [x] **Code-quality / robustness hardening (2026-09-19)** — see PLAN.md step 9.
+      All four phases landed:
+      — **Phase 1 (bugs).** `capture.py` no longer accumulates frames: the
+      reader thread reassembles a frame across short reads and keeps only the
+      newest in a single slot (`read_frame` consumes it), so memory is bounded
+      and frames can't desync. New `test_capture.py` (4) proves this with a
+      fake short-read pipe. `settings.parse_args` now range-validates its flags
+      (`brightness`/`width`/`height`/`tick`/`alpha`/`reactivity`/`min-delta`/
+      `max-step`/`change-threshold`/`heartbeat`/`timeout`/`retry`); `dict[str,
+      any]`→`Any`; dropped dead `_pixel_count`; `ledctl.py` uses
+      `get_running_loop()`; dropped the unused `ScreenCapture(mac=…)` arg.
+      — **Phase 2 (hardening).** Control socket is `chmod 0600`; `_PortalCall`
+      removes its `GLib.timeout_add` source; the producer closes the capture
+      object if `CaptureUnavailableError` aborts it; `daemon._writer` wraps the
+      loop so a genuine bug logs one `error` line and stops cleanly (the inner
+      `_writer_loop` keeps all BLE-fault recovery); `capture.py` handshake output
+      goes through `log.py` (debug/info) instead of raw stderr prints.
+      — **Phase 3 (tooling).** `requirements.txt` + `pyproject.toml` (ruff +
+      pytest); `conftest.py` autouse `XDG_STATE_HOME` isolation and
+      `run_tests.py` now passes one temp state dir to every subprocess, so
+      suites run cleanly under both runners; systemd unit rendering deduped into
+      `systemd_user.render_user_unit` + `install_cli`/`uninstall_cli`; the
+      `ambienttray` monolith is now a testable `Tray` class (new
+      `test_tray_class_status_mapping`). Generated ambient unit verified
+      **byte-identical** to the installed one; the stale installed tray unit was
+      refreshed (it had been missing `SyslogIdentifier=ambienttray`).
+      — **Phase 4 (perf).** `coloralg.py` computes HSV once per pixel
+      (`_valid_hsv`); `_kmeans_rgb` now returns `(centroids, sizes)` so
+      `kmeans_cluster` no longer repeats the assignment pass. Algorithm outputs
+      unchanged (`test_coloralg.py` green).
+      **Verified:** `run_tests.py` 9/9 suites and `pytest` 42 tests pass; `ruff
+      check .` clean; CLI guards reject out-of-range flags; a 6 s live
+      `--no-write` dry-run smoke on an isolated socket ran the full portal →
+      capture → hue pipeline and exited cleanly on SIGTERM (socket unlinked).
+
+- [x] **Control-panel ack blink + reaction-speed retune (2026-09-19)** —
+      `algo`/`reactivity`/`on`/`off` from the tray or `ambientctl` now blink the
+      strip **twice** as confirmation (`Daemon._request_ack` + writer-side
+      `_maybe_blink`; only on an actual change; best-effort). And the slow end of
+      the reaction slider was cut: `REACTIVITY_ALPHA_RANGE` 0.5–1.0,
+      `REACTIVITY_MAX_STEP_RANGE` 10–90° (old 0.05–0.75 / 1–15°), defaults now
+      `DEFAULT_ALPHA 0.5` / `DEFAULT_MAX_STEP 10.0` (`R=0`). `R=100` ≈ 450°/s
+      (was 75°/s). Tests updated + new `test_handle_command_requests_ack` /
+      `test_writer_ack_blink`.
 
 Current milestone: Step 4 tuning (needs live tuning on a range of wallpapers);
 Step 5 (install/enable + live socket control under systemd) is done and fully
@@ -150,11 +195,15 @@ Full pipeline is: `capture.py` → `coloralg.py` → smoother (`hue.py` circular
 EMA, driven by `daemon.py`) → `ble_link.Strip` (reconnectable BLE writer).
 The codebase was split into single-responsibility modules on 2026-09-19 (see
 the milestone below and `docs/ARCHITECTURE.md` for the map). The offline suites
-run with `python3 run_tests.py` — `test_coloralg.py` (4), `test_hue.py` (5),
-`test_settings.py` (4), `test_daemon.py` (8), `test_control_socket.py` (6),
-`test_tray.py` (4), `test_tray_icon.py` (1) all pass on this host. The daemon is
-installed + enabled as `ambient.service` and running; the tray
-(`ambienttray`) is run manually for now.
+run with `python3 run_tests.py` (subprocess-isolated) or `pytest` — current
+counts: `test_capture.py` (4), `test_coloralg.py` (6), `test_hue.py` (5),
+`test_settings.py` (4), `test_daemon.py` (10), `test_control_socket.py` (6),
+`test_tray.py` (5), `test_tray_icon.py` (1), `test_log.py` (3) — 44 via pytest,
+all green on this host. `test_device.py` is excluded (raw BLE I/O at import).
+Deps/tooling: `requirements.txt` (bleak + PySide6; PyGObject/GStreamer are
+system packages) and `pyproject.toml` (ruff + pytest config). `ruff check .` is
+clean. The daemon is installed + enabled as `ambient.service` and running; the
+tray is now the enabled user service `ambient-tray.service`.
 
 Docs live in **`README.md`** (overview) + **`docs/`** (`ARCHITECTURE.md` module
 map, `protocol.md`, `usage.md`, `troubleshooting.md`). Keep them in sync when
@@ -341,13 +390,28 @@ asyncio tasks:
   `heartbeat failed (ConnectionError): strip link is down` → `connected to …`
   → colour re-synced, all in ~1 s. The strip cannot stall in its own effect
   mode because colour frames arrive every heartbeat or on reconnect.
-- **Reaction-speed mapping (2026-09-18).** `--reactivity R` (0–100) is a single
-  knob exposed by the tray slider; `reactivity_to_params(R)` maps it linearly to
-  BOTH the tracking EMA and the per-write sweep:
-  `alpha = 0.05 + 0.70·R/100` (0.05…0.75), `max_step = 1 + 14·R/100` (1…15°).
-  `R=50` reproduces the tuned defaults (alpha 0.4, max_step 8.0°) exactly.
-  `params_to_reactivity()` inverts it from `max_step` (a `max_step` of 0 means
-  the limit is disabled, treated as fastest → 100).
+- **Reaction-speed mapping (retuned 2026-09-19).** `--reactivity R` (0–100) is a
+  single knob exposed by the tray slider; `reactivity_to_params(R)` maps it
+  linearly to BOTH the tracking EMA and the per-write sweep:
+  `alpha = 0.5 + 0.5·R/100` (0.5…1.0), `max_step = 10 + 80·R/100` (10…90°).
+  The old bottom ~60% (alpha 0.05–0.47, max_step 1–9°) was unusably slow (tens
+  of seconds per sweep), so it was dropped: **`R=0` is now the defaults**
+  (`DEFAULT_ALPHA` 0.5 / `DEFAULT_MAX_STEP` 10°, ~50°/s) and `R=100` is
+  `alpha 1.0` / `90°/write` (~450°/s at the 5 Hz cap — a half-wheel swing in
+  ~0.4 s). `params_to_reactivity()` inverts it from `max_step` (a `max_step` of
+  0 means the limit is disabled, treated as fastest → 100).
+- **Control-panel ack blink (2026-09-19).** Every live change from the tray /
+  `ambientctl` — `algo NAME`, `reactivity N`, `on`, `off` (only on an actual
+  change, not a repeated same-value command) — makes the strip blink **twice**
+  as visual confirmation. `handle_command` calls `_request_ack()`
+  (sets `_ack` + `_notify`); the writer owns the link, so `_maybe_blink()` runs
+  on the writer task and writes `black → colour` twice (current hue; 0.12 s / 0.16 s
+  pulse timing). It is best-effort: skipped in `--no-write` or when unlinked, and
+  a failed blink just nulls `_last_written_hue` so the next loop re-syncs the
+  colour (never raises). On `off` the blink happens before the link is released;
+  on `on` it happens after reconnect + `FRAME_ON`. Constants
+  `ACK_BLINK_OFF_S`/`ACK_BLINK_ON_S` live in `daemon.py`.
+  Tests: `test_handle_command_requests_ack`, `test_writer_ack_blink`.
 - Flags: `--algo --brightness --width/--height --tick --alpha --min-delta
   --max-step --reactivity --change-threshold --heartbeat --timeout --retry
   --stop-state off|last --no-write --socket`.
@@ -355,8 +419,8 @@ asyncio tasks:
   socket are written atomically to `state_path()` =
   `$XDG_STATE_HOME|~/.local/state` + `/ambient/state.json`. Startup precedence
   in `settings.resolve_control(cfg)`: explicit CLI flags (`--reactivity`, then
-  `--alpha`/`--max-step`, then `--algo`) > saved state > `DEFAULT_ALPHA` 0.4 /
-  `DEFAULT_MAX_STEP` 8.0 (reactivity 50). `--algo`/`--alpha`/`--max-step` default
+  `--alpha`/`--max-step`, then `--algo`) > saved state > `DEFAULT_ALPHA` 0.5 /
+  `DEFAULT_MAX_STEP` 10.0 (reactivity 0). `--algo`/`--alpha`/`--max-step` default
   to `None`; `parse_args` uses a `_Formatter` that hides `(default: None)`.
   `load_saved_control()` returns `{}` on missing/corrupt JSON.
 - **Portal-Start hardening (2026-09-18).** The KWin consent handshake (portal
@@ -436,8 +500,8 @@ asyncio tasks:
   submenu (from `coloralg.ALGORITHMS`, sends `algo NAME` over the socket),
   **Reaction speed …** (opens the slider popup), Start/Stop daemon
   (`systemctl --user start ambient` / `stop` command), Quit.
-- **Reaction-speed slider** (`reactivity 0-100`, one axis: smooth/slow ↔
-  quick/responsive). It lives in a small frameless `Qt.Tool` popup opened from
+- **Reaction-speed slider** (`reactivity 0-100`, one axis: calm ↔ instant; see
+  the retuned mapping below). It lives in a small frameless `Qt.Tool` popup opened from
   the menu — **not embedded in the QMenu**, because Plasma renders the tray menu
   over DBusMenu which can't host arbitrary widgets. `_build_speed_panel()` in
   `ambienttray` builds it (Qt imported lazily so the module still imports
